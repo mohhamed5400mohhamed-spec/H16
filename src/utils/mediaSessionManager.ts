@@ -278,15 +278,17 @@ class UnifiedMediaSessionManager {
     if (this.activeMedia?.id !== id) return;
     this.clearUnexpectedPauseRecovery();
 
-    // Restore suspended Wall Video/YouTube if a Voice Note finished
-    const prevSuspended = this.suspendedMediaStack.pop();
-    if (prevSuspended && !this.isInCallMode) {
-      this.activeMedia = prevSuspended;
-      this.syncNavigatorMediaSession();
-      try {
-        prevSuspended.onPlay();
-      } catch {}
-      return;
+    // Restore suspended Wall Video/YouTube only if not currently in Call/Mic mode
+    if (!this.isInCallMode) {
+      const prevSuspended = this.suspendedMediaStack.pop();
+      if (prevSuspended) {
+        this.activeMedia = prevSuspended;
+        this.syncNavigatorMediaSession();
+        try {
+          prevSuspended.onPlay();
+        } catch {}
+        return;
+      }
     }
 
     if (this.keepAliveDescriptor && id !== this.keepAliveDescriptor.id) {
@@ -514,6 +516,10 @@ class UnifiedMediaSessionManager {
     if (!this.isInCallMode) return;
     this.isInCallMode = false;
 
+    if (this.activeMedia?.kind === 'call') {
+      this.activeMedia = null;
+    }
+
     const ctx = this.monitorCtx;
     if (ctx && ctx.state === 'suspended') {
       ctx.resume().catch(() => {});
@@ -536,6 +542,8 @@ class UnifiedMediaSessionManager {
       try {
         this.keepAliveDescriptor.onPlay();
       } catch {}
+    } else if (!this.activeMedia) {
+      this.clearNavigatorMediaSession();
     }
   }
 
@@ -584,21 +592,22 @@ class UnifiedMediaSessionManager {
       navigator.mediaSession.playbackState = media.isPlaying ? 'playing' : 'paused';
     } catch {}
 
-    if (
-      'setPositionState' in navigator.mediaSession &&
-      typeof media.duration === 'number' &&
-      isFinite(media.duration) &&
-      media.duration > 0
-    ) {
-      try {
-        const dur = Math.max(1, media.duration);
-        const pos = Math.max(0, Math.min(dur, media.currentTime || 0));
-        navigator.mediaSession.setPositionState({
-          duration: dur,
-          playbackRate: media.playbackRate || 1,
-          position: pos
-        });
-      } catch {}
+    if ('setPositionState' in navigator.mediaSession) {
+      if (typeof media.duration === 'number' && isFinite(media.duration) && media.duration > 0) {
+        try {
+          const dur = Math.max(1, media.duration);
+          const pos = Math.max(0, Math.min(dur, media.currentTime || 0));
+          navigator.mediaSession.setPositionState({
+            duration: dur,
+            playbackRate: media.playbackRate || 1,
+            position: pos
+          });
+        } catch {}
+      } else {
+        try {
+          (navigator.mediaSession as any).setPositionState();
+        } catch {}
+      }
     }
   }
 

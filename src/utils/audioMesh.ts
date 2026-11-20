@@ -1410,9 +1410,13 @@ export class AudioMeshManager {
       if (rawTrack) {
         rawTrack.enabled = !this.isMuted && !this.isAdminMuted;
         this.peers.forEach((peer) => {
-          peer.pc.getSenders().forEach((sender) => {
-            if (sender.track && sender.track.kind === 'audio') {
-              sender.replaceTrack(rawTrack).catch(() => {});
+          peer.pc.getTransceivers().forEach((tr) => {
+            const isAudioTr =
+              tr.sender?.track?.kind === 'audio' ||
+              tr.receiver?.track?.kind === 'audio' ||
+              (!tr.sender?.track && peer.isInitiator);
+            if (isAudioTr && tr.sender) {
+              tr.sender.replaceTrack(rawTrack).catch(() => {});
             }
           });
         });
@@ -1522,9 +1526,13 @@ export class AudioMeshManager {
       if (processedTrack) {
         processedTrack.enabled = !this.isAdminMuted && (!this.isMuted || this.musicState.isActive);
         this.peers.forEach((peer) => {
-          peer.pc.getSenders().forEach((sender) => {
-            if (sender.track && sender.track.kind === 'audio') {
-              sender.replaceTrack(processedTrack).catch(() => {});
+          peer.pc.getTransceivers().forEach((tr) => {
+            const isAudioTr =
+              tr.sender?.track?.kind === 'audio' ||
+              tr.receiver?.track?.kind === 'audio' ||
+              (!tr.sender?.track && peer.isInitiator);
+            if (isAudioTr && tr.sender) {
+              tr.sender.replaceTrack(processedTrack).catch(() => {});
             }
           });
         });

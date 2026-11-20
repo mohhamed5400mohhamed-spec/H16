@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import {
   Music,
   Play,
@@ -13,7 +13,7 @@ import {
   MicOff,
   RotateCcw,
   RotateCw,
-  ChevronUp
+  GripHorizontal
 } from 'lucide-react';
 import type { SharedMusicState } from '../utils/audioMesh';
 
@@ -51,6 +51,91 @@ export const MusicShareMiniPlayer: React.FC<MusicShareMiniPlayerProps> = ({
 }) => {
   const [sizeMode, setSizeMode] = useState<'minimized' | 'compact' | 'expanded'>('compact');
   const [lastVolumeBeforeMute, setLastVolumeBeforeMute] = useState<number>(75);
+  const [position, setPosition] = useState<{ x: number; y: number }>(() => {
+    if (typeof window === 'undefined') return { x: 12, y: 140 };
+    const defaultW = Math.min(325, Math.max(240, window.innerWidth - 16));
+    return {
+      x: Math.max(8, Math.round((window.innerWidth - defaultW) / 2)),
+      y: Math.max(70, window.innerHeight - 285)
+    };
+  });
+  const [isDragging, setIsDragging] = useState(false);
+
+  const containerRef = useRef<HTMLDivElement | null>(null);
+  const dragSessionRef = useRef<{
+    pointerId: number;
+    startClientX: number;
+    startClientY: number;
+    startPosX: number;
+    startPosY: number;
+    moved: boolean;
+    restoreOnTap: boolean;
+  } | null>(null);
+
+  const clampPositionToViewport = (rawX: number, rawY: number) => {
+    if (typeof window === 'undefined') return { x: rawX, y: rawY };
+    const rect = containerRef.current?.getBoundingClientRect();
+    const width = rect?.width || (sizeMode === 'minimized' ? 124 : sizeMode === 'expanded' ? 355 : 320);
+    const height = rect?.height || (sizeMode === 'minimized' ? 42 : 180);
+    const maxX = Math.max(8, window.innerWidth - width - 8);
+    const maxY = Math.max(8, window.innerHeight - height - 8);
+    return {
+      x: Math.max(8, Math.min(maxX, Math.round(rawX))),
+      y: Math.max(8, Math.min(maxY, Math.round(rawY)))
+    };
+  };
+
+  useEffect(() => {
+    if (!musicState.isActive) return;
+    const raf = requestAnimationFrame(() => {
+      setPosition((prev) => clampPositionToViewport(prev.x, prev.y));
+    });
+    const onResize = () => {
+      setPosition((prev) => clampPositionToViewport(prev.x, prev.y));
+    };
+    window.addEventListener('resize', onResize);
+    return () => {
+      cancelAnimationFrame(raf);
+      window.removeEventListener('resize', onResize);
+    };
+  }, [sizeMode, musicState.isActive]);
+
+  useEffect(() => {
+    const handlePointerMove = (e: PointerEvent) => {
+      const sess = dragSessionRef.current;
+      if (!sess || e.pointerId !== sess.pointerId) return;
+      const dx = e.clientX - sess.startClientX;
+      const dy = e.clientY - sess.startClientY;
+      if (!sess.moved && Math.hypot(dx, dy) >= 5) {
+        sess.moved = true;
+        setIsDragging(true);
+      }
+      if (sess.moved) {
+        setPosition(clampPositionToViewport(sess.startPosX + dx, sess.startPosY + dy));
+      }
+    };
+
+    const handlePointerUp = (e: PointerEvent) => {
+      const sess = dragSessionRef.current;
+      if (!sess || e.pointerId !== sess.pointerId) return;
+      const wasMoved = sess.moved;
+      const shouldRestore = sess.restoreOnTap;
+      dragSessionRef.current = null;
+      setIsDragging(false);
+      if (!wasMoved && shouldRestore) {
+        setSizeMode('compact');
+      }
+    };
+
+    window.addEventListener('pointermove', handlePointerMove);
+    window.addEventListener('pointerup', handlePointerUp);
+    window.addEventListener('pointercancel', handlePointerUp);
+    return () => {
+      window.removeEventListener('pointermove', handlePointerMove);
+      window.removeEventListener('pointerup', handlePointerUp);
+      window.removeEventListener('pointercancel', handlePointerUp);
+    };
+  }, [sizeMode]);
 
   if (!musicState.isActive) return null;
 
@@ -69,90 +154,102 @@ export const MusicShareMiniPlayer: React.FC<MusicShareMiniPlayerProps> = ({
     }
   };
 
+  const beginDrag = (e: React.PointerEvent, restoreOnTap = false) => {
+    const target = e.target as HTMLElement | null;
+    if (target && target.closest('button, input, [data-no-drag="true"]')) {
+      return;
+    }
+    e.preventDefault();
+    dragSessionRef.current = {
+      pointerId: e.pointerId,
+      startClientX: e.clientX,
+      startClientY: e.clientY,
+      startPosX: position.x,
+      startPosY: position.y,
+      moved: false,
+      restoreOnTap
+    };
+  };
+
+  // Ultra-tiny minimized floating pill (draggable anywhere on screen; tap music icon to restore)
   if (sizeMode === 'minimized') {
     return (
       <div
+        ref={containerRef}
         dir="rtl"
-        className="fixed bottom-[98px] left-2 right-2 sm:left-4 sm:right-auto sm:w-[320px] z-40 mx-auto max-w-md pointer-events-auto animate-in fade-in slide-in-from-bottom-2 duration-150"
+        style={{ left: `${position.x}px`, top: `${position.y}px` }}
+        onPointerDown={(e) => beginDrag(e, true)}
+        className={`fixed z-40 pointer-events-auto touch-none select-none ${
+          isDragging ? 'scale-105 cursor-grabbing' : 'cursor-grab'
+        } transition-transform`}
+        title="اسحب لتحريك الأيقونة لأي مكان • انقر على النغمة لفتح التحكم"
       >
-        <div className="bg-[#1b140e]/95 backdrop-blur-md border border-amber-500/80 rounded-full px-2.5 py-1.5 shadow-2xl flex items-center justify-between gap-2 text-amber-100">
-          <div className="flex items-center gap-1.5 min-w-0 flex-1">
-            <span className="w-6 h-6 rounded-full bg-amber-500/20 border border-amber-400/50 flex items-center justify-center shrink-0">
-              <Music className={`w-3.5 h-3.5 text-amber-400 ${musicState.isPlaying ? 'animate-pulse' : ''}`} />
-            </span>
-            <div className="min-w-0 flex-1">
-              <div className="text-[11px] font-bold truncate text-amber-100">{musicState.trackName}</div>
-              <div className="text-[9px] text-amber-300/80 font-mono leading-none">
-                {formatTime(currentTime)} / {formatTime(duration)}
-              </div>
-            </div>
+        <div className="bg-[#1b140e]/95 backdrop-blur-md border-2 border-amber-500 rounded-full p-1 shadow-2xl flex items-center gap-1 text-amber-100">
+          <div className="w-8 h-8 rounded-full bg-gradient-to-br from-amber-500 to-amber-600 text-slate-950 flex items-center justify-center relative shrink-0 shadow-sm">
+            <Music className={`w-4 h-4 ${musicState.isPlaying ? 'animate-pulse' : ''}`} />
+            <span
+              className={`absolute -top-0.5 -right-0.5 w-2.5 h-2.5 rounded-full border border-slate-950 ${
+                musicState.isPlaying ? 'bg-emerald-400 animate-ping' : 'bg-amber-300'
+              }`}
+            />
           </div>
 
-          <div className="flex items-center gap-1 shrink-0">
-            <button
-              type="button"
-              onClick={onTogglePlayPause}
-              className="w-7 h-7 rounded-full bg-amber-500 hover:bg-amber-400 text-slate-950 flex items-center justify-center cursor-pointer transition-colors"
-              title={musicState.isPlaying ? 'إيقاف مؤقت' : 'تشغيل'}
-            >
-              {musicState.isPlaying ? <Pause className="w-3.5 h-3.5" /> : <Play className="w-3.5 h-3.5 translate-x-[0.5px]" />}
-            </button>
-            <button
-              type="button"
-              onClick={onReplaceTrack}
-              className="w-7 h-7 rounded-full bg-slate-800 hover:bg-slate-700 text-amber-300 border border-amber-500/40 flex items-center justify-center cursor-pointer transition-colors"
-              title="استبدال الأغنية"
-            >
-              <RefreshCw className="w-3 h-3" />
-            </button>
-            <button
-              type="button"
-              onClick={() => setSizeMode('compact')}
-              className="w-7 h-7 rounded-full bg-slate-800 hover:bg-slate-700 text-white border border-slate-600 flex items-center justify-center cursor-pointer transition-colors"
-              title="إظهار نافذة التحكم"
-            >
-              <ChevronUp className="w-3.5 h-3.5" />
-            </button>
-            <button
-              type="button"
-              onClick={onStop}
-              className="w-7 h-7 rounded-full bg-rose-600 hover:bg-rose-500 text-white flex items-center justify-center cursor-pointer transition-colors"
-              title="إيقاف الأغنية كاملة"
-            >
-              <Square className="w-3 h-3 fill-current" />
-            </button>
-          </div>
+          <button
+            type="button"
+            onClick={onTogglePlayPause}
+            className="w-7 h-7 rounded-full bg-slate-800 hover:bg-slate-700 text-amber-300 border border-amber-500/40 flex items-center justify-center cursor-pointer transition-colors"
+            title={musicState.isPlaying ? 'إيقاف مؤقت' : 'تشغيل'}
+          >
+            {musicState.isPlaying ? <Pause className="w-3.5 h-3.5" /> : <Play className="w-3.5 h-3.5 translate-x-[0.5px]" />}
+          </button>
+
+          <button
+            type="button"
+            onClick={onStop}
+            className="w-7 h-7 rounded-full bg-rose-600 hover:bg-rose-500 text-white flex items-center justify-center cursor-pointer transition-colors"
+            title="إيقاف الأغنية كاملة"
+          >
+            <Square className="w-2.5 h-2.5 fill-current" />
+          </button>
         </div>
       </div>
     );
   }
 
   const isExpanded = sizeMode === 'expanded';
+  const cardWidth = isExpanded ? 'w-[min(94vw,375px)]' : 'w-[min(92vw,325px)]';
 
   return (
     <div
+      ref={containerRef}
       dir="rtl"
-      className={`fixed bottom-[98px] left-2 right-2 sm:left-4 sm:right-auto z-40 mx-auto pointer-events-auto animate-in fade-in slide-in-from-bottom-2 duration-150 transition-all ${
-        isExpanded ? 'max-w-md sm:w-[375px]' : 'max-w-[340px] sm:w-[325px]'
-      }`}
+      style={{ left: `${position.x}px`, top: `${position.y}px` }}
+      className={`fixed z-40 pointer-events-auto ${cardWidth} ${isDragging ? 'opacity-95 scale-[1.01]' : ''}`}
     >
-      <div className="bg-[#1b140e]/95 backdrop-blur-md border-2 border-amber-500/85 rounded-2xl shadow-2xl overflow-hidden text-slate-100">
-        {/* Header Bar */}
-        <div className="bg-gradient-to-l from-[#3b2918] via-[#2b1e12] to-[#1e140c] px-2.5 py-1.5 flex items-center justify-between gap-2 border-b border-amber-500/30">
+      <div className="bg-[#1b140e]/95 backdrop-blur-md border-2 border-amber-500/90 rounded-2xl shadow-2xl overflow-hidden text-slate-100">
+        {/* Draggable Header Bar */}
+        <div
+          onPointerDown={(e) => beginDrag(e, false)}
+          className={`bg-gradient-to-l from-[#3b2918] via-[#2b1e12] to-[#1e140c] px-2.5 py-1.5 flex items-center justify-between gap-2 border-b border-amber-500/30 touch-none select-none ${
+            isDragging ? 'cursor-grabbing' : 'cursor-grab'
+          }`}
+          title="اسحب من هنا لتحريك النافذة لأي مكان على الشاشة"
+        >
           <div className="flex items-center gap-1.5 min-w-0 flex-1">
             <span className="w-6 h-6 rounded-lg bg-amber-500/20 border border-amber-400/50 flex items-center justify-center shrink-0">
               <Music className={`w-3.5 h-3.5 text-amber-400 ${musicState.isPlaying ? 'animate-pulse' : ''}`} />
             </span>
             <div className="min-w-0 flex-1">
-              <div className="text-[11px] font-black text-amber-200 truncate" title={musicState.trackName}>
-                {musicState.trackName}
+              <div className="text-[11px] font-black text-amber-200 truncate flex items-center gap-1" title={musicState.trackName}>
+                <GripHorizontal className="w-3 h-3 text-amber-400/70 shrink-0" />
+                <span className="truncate">{musicState.trackName}</span>
               </div>
               <div className="text-[9px] text-amber-300/80 flex items-center gap-1.5">
                 <span className={musicState.isPlaying ? 'text-emerald-400 font-bold' : 'text-amber-300'}>
                   {musicState.isPlaying ? '● يبث للغرفة الآن' : '⏸ متوقف مؤقتاً'}
                 </span>
                 {isExpanded && (
-                  <span className="text-slate-300">
+                  <span className="text-slate-300 truncate">
                     • {isMicMuted ? 'المايك مكتوم (موسيقى فقط)' : 'مايكك + الموسيقى معاً'}
                   </span>
                 )}
@@ -173,7 +270,7 @@ export const MusicShareMiniPlayer: React.FC<MusicShareMiniPlayerProps> = ({
               type="button"
               onClick={() => setSizeMode('minimized')}
               className="w-6 h-6 rounded-lg bg-black/40 hover:bg-black/70 text-slate-200 border border-slate-600/60 flex items-center justify-center cursor-pointer transition-colors"
-              title="تصغير النافذة"
+              title="تصغير النافذة تماماً إلى أيقونة صغيرة"
             >
               <span className="text-[11px] font-black leading-none mb-1">—</span>
             </button>
@@ -263,7 +360,7 @@ export const MusicShareMiniPlayer: React.FC<MusicShareMiniPlayerProps> = ({
               </button>
             </div>
 
-            {/* Optional quick mic mute toggle right inside player */}
+            {/* Quick mic mute toggle right inside player */}
             {onToggleMicMute && (
               <button
                 type="button"

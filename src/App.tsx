@@ -4494,6 +4494,7 @@ export default function App() {
       roomEntryTimestampRef.current = Date.now();
       audioManagerRef.current?.resetForRoomSwitch();
       audioManagerRef.current?.setAdminMuted(Boolean(user.isVoiceMutedByAdmin));
+      mediaSessionManager.deactivateMedia('active-room-mic');
       if (!liveMediaStreamRef.current) {
         mediaSessionManager.exitCallMode();
       }
@@ -5188,6 +5189,7 @@ export default function App() {
 
     s.on('micRevokedByAdmin', ({ adminName }: { adminName: string }) => {
       audioManagerRef.current?.leaveVoice();
+      mediaSessionManager.deactivateMedia('active-room-mic');
       mediaSessionManager.exitCallMode();
       setCurrentUser((prev) =>
         prev
@@ -6308,6 +6310,7 @@ export default function App() {
       showToast(`صعدت الآن إلى المايك رقم (${slotNumber}) 🎙️`, 'success');
       confetti({ particleCount: 30, spread: 50 });
     } else {
+      mediaSessionManager.deactivateMedia('active-room-mic');
       mediaSessionManager.exitCallMode();
       if (result.error) {
         sounds.playError();
@@ -6324,6 +6327,7 @@ export default function App() {
     } else {
       socket.emit('dropMic');
     }
+    mediaSessionManager.deactivateMedia('active-room-mic');
     mediaSessionManager.exitCallMode();
     setSharedMusicState((prev) => ({
       ...prev,
@@ -6405,6 +6409,127 @@ export default function App() {
       'info'
     );
   };
+
+  // Coordinate Phone Notification Bar (MediaSession) for active Room Mic + Shared Music
+  const micMediaSyncRef = useRef<{
+    onPlay: () => void;
+    onPause: () => void;
+    onStop: () => void;
+    onSeekTo: (t: number) => void;
+  }>({
+    onPlay: () => {},
+    onPause: () => {},
+    onStop: () => {},
+    onSeekTo: () => {}
+  });
+
+  micMediaSyncRef.current = {
+    onPlay: () => {
+      const mgr = audioManagerRef.current;
+      if (!mgr) return;
+      const music = mgr.getSharedMusicState();
+      if (music.isActive) {
+        if (!music.isPlaying) {
+          mgr.toggleSharedMusicPause();
+        }
+      } else if (mgr.isMuted) {
+        handleToggleMicMuteUnified();
+      }
+    },
+    onPause: () => {
+      const mgr = audioManagerRef.current;
+      if (!mgr) return;
+      const music = mgr.getSharedMusicState();
+      if (music.isActive) {
+        if (music.isPlaying) {
+          mgr.toggleSharedMusicPause();
+        }
+      } else if (!mgr.isMuted) {
+        handleToggleMicMuteUnified();
+      }
+    },
+    onStop: () => {
+      const mgr = audioManagerRef.current;
+      if (mgr?.getSharedMusicState().isActive) {
+        mgr.stopSharedMusic();
+        showToast('تم إيقاف مشاركة الموسيقى وإغلاق المشغل 🎵', 'info');
+      } else {
+        handleDropMic();
+      }
+    },
+    onSeekTo: (t: number) => {
+      audioManagerRef.current?.seekSharedMusic(t);
+    }
+  };
+
+  useEffect(() => {
+    const slot = currentUser?.micSlot ?? null;
+    const mgr = audioManagerRef.current || audioManager;
+    const micMuted = Boolean(mgr?.isMuted || currentUser?.isMuted);
+
+    if (slot === null) {
+      if (mediaSessionManager.getActiveMediaId() === 'active-room-mic') {
+        mediaSessionManager.deactivateMedia('active-room-mic');
+        if (!activeCall && !incomingCall && !liveMediaStreamRef.current) {
+          mediaSessionManager.exitCallMode();
+        }
+      }
+      if (sharedMusicState.isActive) {
+        mgr?.stopSharedMusic();
+      }
+      return;
+    }
+
+    mediaSessionManager.enterCallMode();
+
+    const title = sharedMusicState.isActive
+      ? `🎵 ${sharedMusicState.trackName}`
+      : `🎙️ على المايك رقم (${slot})`;
+    const artist = sharedMusicState.isActive
+      ? `مايك (${slot}) • ${micMuted ? 'موسيقى فقط (المايك مكتوم) 🔇' : 'صوتك + الموسيقى معاً 🎙️'}`
+      : `غرفة: ${currentUser?.room || 'الغرفة العامة'} • ${micMuted ? 'المايك مكتوم 🔇' : 'يبث صوتك الآن 🟢'}`;
+    const duration =
+      sharedMusicState.isActive && sharedMusicState.duration > 0 ? sharedMusicState.duration : undefined;
+    const currentTime = sharedMusicState.isActive ? sharedMusicState.currentTime : undefined;
+    const isPlaying = sharedMusicState.isActive ? sharedMusicState.isPlaying : !micMuted;
+
+    if (mediaSessionManager.getActiveMediaId() !== 'active-room-mic') {
+      mediaSessionManager.activateMedia({
+        id: 'active-room-mic',
+        kind: 'call',
+        title,
+        artist,
+        album: currentUser?.room || 'شات حسان برو',
+        duration,
+        currentTime,
+        isPlaying,
+        onPlay: () => micMediaSyncRef.current.onPlay(),
+        onPause: () => micMediaSyncRef.current.onPause(),
+        onStop: () => micMediaSyncRef.current.onStop(),
+        onSeekTo: (t) => micMediaSyncRef.current.onSeekTo(t)
+      });
+    } else {
+      mediaSessionManager.updateMediaState('active-room-mic', {
+        title,
+        artist,
+        duration,
+        currentTime,
+        isPlaying
+      });
+    }
+  }, [
+    currentUser?.micSlot,
+    currentUser?.room,
+    currentUser?.isMuted,
+    audioManager?.isMuted,
+    sharedMusicState.isActive,
+    sharedMusicState.isPlaying,
+    sharedMusicState.trackName,
+    sharedMusicState.currentTime,
+    sharedMusicState.duration,
+    activeCall,
+    incomingCall
+  ]);
 
   // Toggle Room Speaker
   const handleToggleSpeaker = () => {
