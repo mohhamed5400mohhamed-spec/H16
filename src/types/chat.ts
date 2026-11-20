@@ -111,6 +111,7 @@ export interface User {
   micSlot: number | null;
   isMuted: boolean;
   isTextMuted: boolean;
+  isVoiceMutedByAdmin?: boolean;
   isSpeaking: boolean;
   presenceState?: 'online' | 'away' | 'offline'; // Green dot (online), Yellow dot (away/background), Gray dot (offline)
   ipAddress?: string;

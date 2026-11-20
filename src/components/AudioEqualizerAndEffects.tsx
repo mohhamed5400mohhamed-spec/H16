@@ -27,6 +27,14 @@ export interface AudioEqualizerAndEffectsProps {
   isVoiceActive: boolean;
   onToggleVoice: () => void;
   onShowToast: (msg: string, type?: 'info' | 'success' | 'error') => void;
+  onApplyAudioSettings?: (settings: {
+    effect: VoiceEffectType;
+    micGain: number;
+    noiseSuppression: boolean;
+    echoCancellation: boolean;
+    pushToTalk: boolean;
+  }) => void;
+  onSetMicMuted?: (muted: boolean) => void;
 }
 
 export type VoiceEffectType = 'normal' | 'falcon' | 'robot' | 'helium' | 'studio' | 'radio' | 'echo';
@@ -36,7 +44,9 @@ export const AudioEqualizerAndEffects: React.FC<AudioEqualizerAndEffectsProps> =
   onClose,
   isVoiceActive,
   onToggleVoice,
-  onShowToast
+  onShowToast,
+  onApplyAudioSettings,
+  onSetMicMuted
 }) => {
   const [selectedEffect, setSelectedEffect] = useState<VoiceEffectType>('normal');
   const [micGain, setMicGain] = useState<number>(100); // 0 - 200%
@@ -76,13 +86,51 @@ export const AudioEqualizerAndEffects: React.FC<AudioEqualizerAndEffectsProps> =
   };
 
   useEffect(() => {
+    onApplyAudioSettings?.({
+      effect: selectedEffect,
+      micGain,
+      noiseSuppression,
+      echoCancellation,
+      pushToTalk
+    });
+  }, [selectedEffect, micGain, noiseSuppression, echoCancellation, pushToTalk]);
+
+  useEffect(() => {
+    if (!pushToTalk || !isVoiceActive) return;
+    onSetMicMuted?.(true);
+    const isTypingTarget = (el: EventTarget | null) => {
+      if (!(el instanceof HTMLElement)) return false;
+      const tag = el.tagName;
+      return tag === 'INPUT' || tag === 'TEXTAREA' || el.isContentEditable;
+    };
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.code === 'Space' && !e.repeat && !isTypingTarget(e.target)) {
+        e.preventDefault();
+        onSetMicMuted?.(false);
+      }
+    };
+    const onKeyUp = (e: KeyboardEvent) => {
+      if (e.code === 'Space' && !isTypingTarget(e.target)) {
+        e.preventDefault();
+        onSetMicMuted?.(true);
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    window.addEventListener('keyup', onKeyUp);
+    return () => {
+      window.removeEventListener('keydown', onKeyDown);
+      window.removeEventListener('keyup', onKeyUp);
+    };
+  }, [pushToTalk, isVoiceActive]);
+
+  useEffect(() => {
     return () => {
       if (micStreamRef.current) {
         micStreamRef.current.getTracks().forEach((t) => t.stop());
         micStreamRef.current = null;
       }
       if (ambientOscRef.current) {
-        try { ambientOscRef.current.stop(); } catch {}
+        try { ambientOscRef.current.stop(); ambientOscRef.current.disconnect(); } catch {}
         ambientOscRef.current = null;
       }
       if (audioCtxRef.current && audioCtxRef.current.state !== 'closed') {
@@ -164,6 +212,13 @@ export const AudioEqualizerAndEffects: React.FC<AudioEqualizerAndEffectsProps> =
   // Ambient sound synthesizer
   const playAmbientSound = (type: 'none' | 'rain' | 'campfire' | 'oud' | 'desert') => {
     setAmbientSound(type);
+    if (ambientOscRef.current) {
+      try {
+        ambientOscRef.current.stop();
+        ambientOscRef.current.disconnect();
+      } catch {}
+      ambientOscRef.current = null;
+    }
     if (type === 'none') {
       if (ambientGainRef.current) {
         ambientGainRef.current.gain.setValueAtTime(0, audioCtxRef.current?.currentTime || 0);
@@ -200,11 +255,7 @@ export const AudioEqualizerAndEffects: React.FC<AudioEqualizerAndEffectsProps> =
       osc.connect(filter);
       filter.connect(ambientGainRef.current);
       osc.start();
-      setTimeout(() => {
-        try {
-          osc.stop();
-        } catch {}
-      }, 5000);
+      ambientOscRef.current = osc;
       onShowToast(`تم تشغيل خلفية صوتية: ${type === 'rain' ? 'مطر هادئ 🌧️' : type === 'campfire' ? 'نار مخيم 🔥' : type === 'desert' ? 'نسيم الصحراء 🏜️' : 'عزف عود 🎵'}`, 'success');
     } catch (e) {
       console.error(e);

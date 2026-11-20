@@ -608,6 +608,7 @@ export interface ConnectedUser {
   micSlot: number | null; // 1 to 5, or null
   isMuted: boolean;
   isTextMuted: boolean;
+  isVoiceMutedByAdmin?: boolean;
   isSpeaking: boolean;
   presenceState?: 'online' | 'away' | 'offline'; // Green dot (online), Yellow dot (away/background), Gray dot (offline)
   ipAddress?: string;
@@ -1106,7 +1107,7 @@ function canPerformModeration(
 
   // 1. Self-penalty & Strict Numeric Hierarchy checks (الأعلى رقماً يتحكم في كل من تحته حتى لو كان admin)
   if (target) {
-    if (target.id && target.id === actor.id && (action === 'kick' || action === 'ban' || action === 'mute' || action === 'deleteAvatar' || action === 'jailUser' || action === 'deleteAccount')) {
+    if (target.id && target.id === actor.id && (action === 'kick' || action === 'ban' || action === 'mute' || action === 'muteVoice' || action === 'deleteAvatar' || action === 'jailUser' || action === 'deleteAccount')) {
       return { allowed: false, reason: 'لا يمكنك تطبيق العقوبات على نفسك.' };
     }
     if (target.username.toLowerCase() === actor.username.toLowerCase() && (action === 'kick' || action === 'ban' || action === 'jailUser' || action === 'deleteAccount')) {
@@ -1131,6 +1132,7 @@ function canPerformModeration(
     kick: 'canKick',
     mute: 'canMute',
     unmuteText: 'canMute',
+    muteVoice: 'canMuteVoice',
     unmuteVoice: 'canMuteVoice',
     pullMic: 'canPullMic',
     warn: 'canWarn',
@@ -2704,6 +2706,44 @@ export interface RoomLiveBroadcast {
 // Global Active Live Broadcasts Map by room
 const activeLiveBroadcasts: Map<string, RoomLiveBroadcast> = new Map();
 
+function serializeLiveBroadcast(live: RoomLiveBroadcast | undefined) {
+  if (!live) return null;
+  return {
+    broadcasterId: live.broadcasterId,
+    broadcasterUsername: live.broadcasterUsername,
+    broadcasterDisplayName: live.broadcasterDisplayName || live.broadcasterUsername,
+    broadcasterAvatar: live.broadcasterAvatar,
+    broadcasterFlag: live.broadcasterFlag,
+    room: live.room,
+    title: live.title,
+    startedAt: live.startedAt,
+    viewersCount: live.viewers.length
+  };
+}
+
+function cleanupUserLiveState(socketId: string, onlyRoom?: string) {
+  if (!socketId) return;
+  for (const [rId, live] of Array.from(activeLiveBroadcasts.entries())) {
+    if (onlyRoom && rId !== onlyRoom) continue;
+    if (live.broadcasterId === socketId) {
+      activeLiveBroadcasts.delete(rId);
+      io.to(rId).emit('liveBroadcastEnded', {
+        room: rId,
+        broadcasterUsername: live.broadcasterUsername
+      });
+    } else if (live.viewers.includes(socketId)) {
+      live.viewers = live.viewers.filter((id) => id !== socketId);
+      io.to(rId).emit('liveViewerCountUpdated', {
+        room: rId,
+        count: live.viewers.length
+      });
+      if (live.broadcasterId) {
+        io.to(live.broadcasterId).emit('liveViewerLeft', { viewerId: socketId });
+      }
+    }
+  }
+}
+
 // Registered members store structure
 export interface RegisteredMemberInfo {
   password: string;
@@ -3436,6 +3476,50 @@ function getMicSlotsForRoom(room: string) {
   return roomMicSlots[room];
 }
 
+function releaseUserMic(user: ConnectedUser, roomId?: string): number | null {
+  const targetRoom = roomId || user.room;
+  const hadVoice = user.micSlot !== null || user.isVoice;
+  let releasedNumber: number | null = user.micSlot;
+
+  if (targetRoom) {
+    const slots = getMicSlotsForRoom(targetRoom);
+    slots.forEach((s) => {
+      if (
+        s.user &&
+        (s.user.id === user.id ||
+          s.user.username.toLowerCase() === user.username.toLowerCase() ||
+          (user.micSlot !== null && s.slotNumber === user.micSlot))
+      ) {
+        if (releasedNumber === null) releasedNumber = s.slotNumber;
+        s.user = null;
+      }
+    });
+    if (hadVoice && targetRoom !== 'خارج الغرف') {
+      io.to(targetRoom).emit('micSlotsUpdated', slots);
+      io.to(targetRoom).emit('userLeftVoice', { userId: user.id, username: user.username });
+    }
+  }
+
+  user.micSlot = null;
+  user.isVoice = false;
+  user.isSpeaking = false;
+  user.isMuted = Boolean(user.isTextMuted || user.isVoiceMutedByAdmin);
+
+  for (const sess of activeSessions.values()) {
+    if (sess.user && sess.user.username.toLowerCase() === user.username.toLowerCase()) {
+      sess.user.micSlot = null;
+      sess.user.isVoice = false;
+      sess.user.isSpeaking = false;
+      sess.user.isMuted = user.isMuted;
+    }
+  }
+
+  if (hadVoice) {
+    broadcastRoomsUpdate();
+  }
+  return releasedNumber;
+}
+
 export function getActiveVoiceCountForRoom(roomId: string): number {
   const slots = roomMicSlots[roomId];
   if (slots && Array.isArray(slots)) {
@@ -3821,19 +3905,11 @@ function moveConnectedUserToRoom(
   const oldRoom = target.room;
   if (oldRoom === targetRoomId) return;
 
-  // Release mic in old room if holding one
+  // Release mic & live broadcast state in old room
   if (target.micSlot !== null || target.isVoice) {
-    const oldSlots = getMicSlotsForRoom(oldRoom);
-    const slot = oldSlots.find((s) => s.user && (s.user.id === target.id || s.slotNumber === target.micSlot));
-    if (slot) slot.user = null;
-    target.micSlot = null;
-    target.isVoice = false;
-    target.isSpeaking = false;
-    if (oldRoom && oldRoom !== 'خارج الغرف') {
-      io.to(oldRoom).emit('micSlotsUpdated', oldSlots);
-      io.to(oldRoom).emit('userLeftVoice', { userId: target.id });
-    }
+    releaseUserMic(target, oldRoom);
   }
+  cleanupUserLiveState(target.id, oldRoom);
 
   target.room = targetRoomId;
 
@@ -3858,6 +3934,7 @@ function moveConnectedUserToRoom(
     targetSocket.emit('forceMoveRoom', { room: targetRoomId });
     targetSocket.emit('roomJoined', { user: target });
     targetSocket.emit('micSlotsUpdated', getMicSlotsForRoom(targetRoomId));
+    targetSocket.emit('currentLiveBroadcast', serializeLiveBroadcast(activeLiveBroadcasts.get(targetRoomId)));
     if (roomPinnedMessages[targetRoomId]) {
       targetSocket.emit('roomPinnedMessageUpdated', roomPinnedMessages[targetRoomId]);
     }
@@ -4409,6 +4486,7 @@ io.on('connection', (socket) => {
           blockExternalLinks: serverSecurity.blockExternalLinks
         }
       });
+      socket.emit('currentLiveBroadcast', serializeLiveBroadcast(activeLiveBroadcasts.get(targetRoomId)));
     }
   );
 
@@ -5589,14 +5667,11 @@ io.on('connection', (socket) => {
     const user = users.find((u) => u.id === socket.id);
     if (!user) return;
     const currentRoom = room || user.room;
-    if (user.micSlot !== null) {
-      const slots = getMicSlotsForRoom(currentRoom);
-      const slot = slots.find((s) => s.slotNumber === user.micSlot);
-      if (slot) slot.user = null;
-      user.micSlot = null;
-      user.isVoice = false;
-      io.to(currentRoom).emit('micSlotsUpdated', slots);
+    if (user.micSlot !== null || user.isVoice) {
+      releaseUserMic(user, currentRoom);
     }
+    cleanupUserLiveState(socket.id, currentRoom);
+    socket.emit('currentLiveBroadcast', null);
     socket.leave(currentRoom);
     user.room = 'خارج الغرف';
     user.presenceState = user.presenceState || 'online';
@@ -5932,13 +6007,28 @@ io.on('connection', (socket) => {
 
       // Transfer any active live broadcast or viewer entry to the new socket before closing the old socket
       let supersededOldSocket: any = null;
+      const reconnectedBroadcasts: RoomLiveBroadcast[] = [];
       if (oldSocketId && oldSocketId !== socket.id) {
-        for (const [, live] of activeLiveBroadcasts.entries()) {
+        for (const [rId, live] of Array.from(activeLiveBroadcasts.entries())) {
           if (live.broadcasterId === oldSocketId) {
-            live.broadcasterId = socket.id;
+            if (rId === targetRoom) {
+              live.broadcasterId = socket.id;
+              reconnectedBroadcasts.push(live);
+            } else {
+              activeLiveBroadcasts.delete(rId);
+              io.to(rId).emit('liveBroadcastEnded', { room: rId, broadcasterUsername: live.broadcasterUsername });
+            }
           }
           if (live.viewers.includes(oldSocketId)) {
-            live.viewers = live.viewers.map((id) => (id === oldSocketId ? socket.id : id));
+            if (rId === targetRoom) {
+              live.viewers = live.viewers.map((id) => (id === oldSocketId ? socket.id : id));
+            } else {
+              live.viewers = live.viewers.filter((id) => id !== oldSocketId);
+              io.to(rId).emit('liveViewerCountUpdated', { room: rId, count: live.viewers.length });
+              if (live.broadcasterId) {
+                io.to(live.broadcasterId).emit('liveViewerLeft', { viewerId: oldSocketId });
+              }
+            }
           }
         }
         const existingUserEntry = users.find((u) => u.id === oldSocketId);
@@ -6019,13 +6109,16 @@ io.on('connection', (socket) => {
         } catch {}
       }
 
-      if (session.user.micSlot !== null && !isUserJailed) {
+      if (session.user.micSlot !== null && !isUserJailed && targetRoom && targetRoom !== 'خارج الغرف') {
         const slots = getMicSlotsForRoom(targetRoom);
         const slot = slots.find((s) => s.slotNumber === session!.user.micSlot);
         if (slot) {
           slot.user = session.user;
           io.to(targetRoom).emit('micSlotsUpdated', slots);
+          broadcastRoomsUpdate();
         }
+      } else if (isUserJailed && session.user.micSlot !== null) {
+        releaseUserMic(session.user);
       }
 
       socket.emit('sessionRestored', {
@@ -6082,8 +6175,24 @@ io.on('connection', (socket) => {
       broadcastRoomUsers(targetRoom);
       broadcastAllUsers();
       socket.emit('micSlotsUpdated', getMicSlotsForRoom(targetRoom));
+      socket.emit('currentLiveBroadcast', serializeLiveBroadcast(activeLiveBroadcasts.get(targetRoom)));
 
-      // Notify active speakers in this room so they initiate WebRTC audio to the restored listener
+      // Re-sync live broadcast WebRTC viewer connections if broadcaster restored session
+      for (const live of reconnectedBroadcasts) {
+        live.viewers.forEach((viewerId) => {
+          if (viewerId !== socket.id) {
+            io.to(viewerId).emit('liveBroadcasterReconnected', { broadcasterId: socket.id, room: live.room });
+            const viewerUser = users.find((u) => u.id === viewerId);
+            socket.emit('liveViewerJoined', {
+              viewerId,
+              viewerUsername: viewerUser?.username || 'مشاهد'
+            });
+          }
+        });
+      }
+
+      // Notify active speakers in this room so they initiate WebRTC audio to the restored listener,
+      // and if the restored user themselves holds an active mic, send them all room peers so WebRTC resumes!
       if (targetRoom && targetRoom !== 'خارج الغرف') {
         users
           .filter((u) => u.room === targetRoom && u.isVoice && u.id !== socket.id)
@@ -6093,6 +6202,14 @@ io.on('connection', (socket) => {
               username: session!.user.username
             });
           });
+
+        if (session.user.isVoice && session.user.micSlot !== null) {
+          const otherRoomPeers = users
+            .filter((u) => u.room === targetRoom && u.id !== socket.id)
+            .map((u) => ({ id: u.id, username: u.username, isVoice: Boolean(u.isVoice) }));
+          socket.emit('voiceRoomUsers', otherRoomPeers);
+          socket.broadcast.to(targetRoom).emit('userJoinedVoice', session.user);
+        }
       }
 
       const userRoleLevel = getRoleLevel(session.user.role);
@@ -6147,13 +6264,14 @@ io.on('connection', (socket) => {
     }
 
     const idx = users.findIndex((u) => u.id === socket.id || (uName && u.username.toLowerCase() === uName.toLowerCase()));
+    cleanupUserLiveState(socket.id);
     if (idx !== -1) {
       const user = users.splice(idx, 1)[0];
-      if (user.micSlot !== null) {
-        const slots = getMicSlotsForRoom(user.room);
-        const slot = slots.find((s) => s.slotNumber === user.micSlot);
-        if (slot) slot.user = null;
-        io.to(user.room).emit('micSlotsUpdated', slots);
+      if (user.id && user.id !== socket.id) {
+        cleanupUserLiveState(user.id);
+      }
+      if (user.micSlot !== null || user.isVoice) {
+        releaseUserMic(user, user.room);
       }
       logMonitorEvent('leave', `سجل ${user.username} خروجاً رسمياً من الدردشة${user.isGhost ? ' (دخول مخفي 👻)' : ''}`, user.username);
       if (user.room && user.room !== 'خارج الغرف') {
@@ -7390,13 +7508,13 @@ io.on('connection', (socket) => {
       }
     });
 
-    // 5. Free mic slots for all previous instances of this user in any room
+    // 5. Free mic slots & live state for all previous instances of this user in any room
     users.forEach((u) => {
-      if (u.username.toLowerCase() === cleanUsername.toLowerCase() && u.micSlot !== null) {
-        const slots = getMicSlotsForRoom(u.room);
-        const slot = slots.find((s) => s.slotNumber === u.micSlot);
-        if (slot) slot.user = null;
-        io.to(u.room).emit('micSlotsUpdated', slots);
+      if (u.username.toLowerCase() === cleanUsername.toLowerCase()) {
+        cleanupUserLiveState(u.id);
+        if (u.micSlot !== null || u.isVoice) {
+          releaseUserMic(u, u.room);
+        }
       }
     });
 
@@ -7416,13 +7534,16 @@ io.on('connection', (socket) => {
       const old = users.splice(existingIndex, 1)[0];
       previousRoom = old.room;
       previousIsGhost = Boolean(old.isGhost);
-      if (old.micSlot !== null) {
-        const slots = getMicSlotsForRoom(old.room);
-        const slot = slots.find((s) => s.slotNumber === old.micSlot);
-        if (slot) slot.user = null;
-        io.to(old.room).emit('micSlotsUpdated', slots);
+      if (old.micSlot !== null || old.isVoice) {
+        releaseUserMic(old, old.room);
+      }
+      if (old.room !== finalTargetRoom) {
+        cleanupUserLiveState(socket.id, old.room);
       }
       socket.leave(old.room);
+      if (old.room && old.room !== 'خارج الغرف') {
+        broadcastRoomUsers(old.room);
+      }
     }
 
     const regResult = getRegisteredMember(cleanUsername);
@@ -7567,9 +7688,10 @@ io.on('connection', (socket) => {
       socket.emit('systemAlert', '🚔 تنبيه: أنت قيد السجن والاحتجاز الإداري في (سجن حسان برو) بموجب قرار إداري صارم. لا يمكنك التحدث أو الكتابة أو مغادرة السجن إلا بقرار الإفراج.');
     }
 
-    // Send mic slots for this room
+    // Send mic slots & active live broadcast state for this room
     const currentSlots = getMicSlotsForRoom(targetRoom);
     socket.emit('micSlotsUpdated', currentSlots);
+    socket.emit('currentLiveBroadcast', serializeLiveBroadcast(activeLiveBroadcasts.get(finalTargetRoom)));
 
     // Notify active mic speakers in this room so they stream WebRTC audio to this newly joined user
     if (finalTargetRoom && finalTargetRoom !== 'خارج الغرف') {
@@ -7953,45 +8075,83 @@ io.on('connection', (socket) => {
     io.to(user.room).emit('message', alertMessageObj);
   });
 
-  // Take Mic slot (1 to 5)
-  socket.on('takeMic', ({ slotNumber }: { slotNumber: number }) => {
+  // Take Mic slot (1 to 5) with explicit server validation & ack callback
+  socket.on('takeMic', (payload: { slotNumber: number }, callback?: (res: { ok: boolean; error?: string; slotNumber?: number }) => void) => {
+    const slotNumber = Number(payload?.slotNumber);
     const user = users.find((u) => u.id === socket.id);
-    if (!user) return;
+    const fail = (errMsg: string) => {
+      socket.emit('micError', errMsg);
+      if (typeof callback === 'function') callback({ ok: false, error: errMsg });
+    };
+
+    if (!user) {
+      fail('يجب تسجيل الدخول أولاً للصعود إلى المايك.');
+      return;
+    }
+
+    if (user.room === 'خارج الغرف') {
+      fail('يجب دخول غرفة أولاً للصعود إلى المايك.');
+      return;
+    }
+
+    if (user.isJailed) {
+      fail('أنت مقيد في السجن الإداري ولا يمكنك استخدام المايك.');
+      return;
+    }
+
+    const canTakeMic = isSupremeHassan(user) || user.role === 'admin' || user.role === 'super' || hasPermission(user.role, 'canTakeMic');
+    if (!canTakeMic) {
+      fail('عفواً، صلاحية الصعود إلى المايك غير متاحة لرتبتك الحالية.');
+      return;
+    }
 
     if (user.isTextMuted) {
-      socket.emit('micError', 'أنت خاضع للإسكات من قبل الإدارة، لا يمكنك الصعود إلى المايك.');
+      fail('أنت خاضع للإسكات من قبل الإدارة، لا يمكنك الصعود إلى المايك.');
       return;
     }
 
     if (!isSupremeHassan(user) && user.role !== 'admin' && user.role !== 'super' && likesSettings.micLikes > 0 && user.likes < likesSettings.micLikes) {
-      socket.emit('micError', `عفواً، يتطلب الصعود إلى المايك ${likesSettings.micLikes} لايك على الأقل. رصيدك الحالي: ${user.likes} 👍`);
+      fail(`عفواً، يتطلب الصعود إلى المايك ${likesSettings.micLikes} لايك على الأقل. رصيدك الحالي: ${user.likes} 👍`);
       return;
     }
 
     const roomSettings = getRoomSettings(user.room);
-    if (roomSettings.isVoiceLocked && !isSupremeHassan(user) && user.role !== 'admin' && user.role !== 'super') {
-      socket.emit('micError', 'المايكات مقفلة ومحصورة حالياً على الإدارة والمشرفين فقط.');
+    if (roomSettings.isVoiceLocked && !isSupremeHassan(user) && user.role !== 'admin' && user.role !== 'super' && !hasPermission(user.role, 'canLockVoice')) {
+      fail('المايكات مقفلة ومحصورة حالياً على الإدارة والمشرفين فقط.');
       return;
     }
 
     const slots = getMicSlotsForRoom(user.room);
     const targetSlot = slots.find((s) => s.slotNumber === slotNumber);
-    if (!targetSlot) return;
+    if (!targetSlot) {
+      fail('مقعد المايك المحدد غير صالح.');
+      return;
+    }
 
     if (targetSlot.user && targetSlot.user.id !== user.id) {
-      socket.emit('micError', `المايك رقم ${slotNumber} مشغول حالياً.`);
+      fail(`المايك رقم ${slotNumber} مشغول حالياً.`);
       return;
     }
 
     slots.forEach((s) => {
-      if (s.user && s.user.id === user.id) s.user = null;
+      if (s.user && (s.user.id === user.id || s.user.username.toLowerCase() === user.username.toLowerCase())) {
+        s.user = null;
+      }
     });
 
     user.micSlot = slotNumber;
     user.isVoice = true;
-    user.isMuted = false;
+    user.isMuted = Boolean(user.isVoiceMutedByAdmin);
     user.isSpeaking = false;
     targetSlot.user = user;
+
+    for (const sess of activeSessions.values()) {
+      if (sess.user && sess.user.username.toLowerCase() === user.username.toLowerCase()) {
+        sess.user.micSlot = slotNumber;
+        sess.user.isVoice = true;
+        sess.user.isMuted = user.isMuted;
+      }
+    }
 
     logMonitorEvent('mic_take', `صعد ${user.username} إلى المايك (${slotNumber})`, user.username);
     io.to(user.room).emit('micSlotsUpdated', slots);
@@ -8009,6 +8169,13 @@ io.on('connection', (socket) => {
     };
     io.to(user.room).emit('message', micMsg);
 
+    if (typeof callback === 'function') {
+      callback({ ok: true, slotNumber });
+    }
+    if (user.isVoiceMutedByAdmin) {
+      socket.emit('forceVoiceMuteState', { muted: true, by: 'الإدارة' });
+    }
+
     // Send ALL other users in this room (both speakers AND listeners) so WebRTC audio reaches everyone
     const otherRoomPeers = users
       .filter((u) => u.room === user.room && u.id !== socket.id)
@@ -8022,28 +8189,12 @@ io.on('connection', (socket) => {
     const user = users.find((u) => u.id === socket.id);
     if (!user) return;
 
-    const slots = getMicSlotsForRoom(user.room);
-    const slot = slots.find((s) => (user.micSlot !== null && s.slotNumber === user.micSlot) || (s.user && (s.user.id === socket.id || s.user.username.toLowerCase() === user.username.toLowerCase())));
-    const releasedNumber = slot ? slot.slotNumber : (user.micSlot || 1);
-
-    // Free any slot holding this user
-    slots.forEach((s) => {
-      if (s.user && (s.user.id === socket.id || s.user.username.toLowerCase() === user.username.toLowerCase())) {
-        s.user = null;
-      }
-    });
-
     const wasVoice = user.isVoice || user.micSlot !== null;
-    user.micSlot = null;
-    user.isVoice = false;
-    user.isSpeaking = false;
+    const releasedNumber = releaseUserMic(user, user.room);
 
     if (wasVoice) {
-      logMonitorEvent('mic_drop', `نزل ${user.username} من المايك (${releasedNumber})`, user.username);
+      logMonitorEvent('mic_drop', `نزل ${user.username} من المايك (${releasedNumber || 1})`, user.username);
     }
-    io.to(user.room).emit('micSlotsUpdated', slots);
-    broadcastRoomsUpdate();
-    socket.broadcast.to(user.room).emit('userLeftVoice', { userId: socket.id, username: user.username });
   });
 
   socket.on('joinVoice', () => {
@@ -8085,8 +8236,18 @@ io.on('connection', (socket) => {
     const user = users.find((u) => u.id === socket.id);
     if (!user) return;
 
-    if (typeof isMuted === 'boolean') user.isMuted = isMuted;
-    if (typeof isSpeaking === 'boolean') user.isSpeaking = isSpeaking;
+    if (typeof isMuted === 'boolean') {
+      if (user.isVoiceMutedByAdmin && !isMuted) {
+        socket.emit('forceVoiceMuteState', { muted: true, by: 'الإدارة' });
+        socket.emit('systemAlert', '🔇 المايك مكتوم عنك من قبل الإدارة ولا يمكنك فتحه حالياً.');
+        user.isMuted = true;
+      } else {
+        user.isMuted = isMuted;
+      }
+    }
+    if (typeof isSpeaking === 'boolean') {
+      user.isSpeaking = user.isMuted ? false : isSpeaking;
+    }
 
     const slots = getMicSlotsForRoom(user.room);
     io.to(user.room).emit('micSlotsUpdated', slots);
@@ -8164,19 +8325,10 @@ io.on('connection', (socket) => {
       }
       // سحب المايك (Revoke Mic)
       case 'pullMic': {
-        if (target && target.micSlot !== null) {
-          const slots = getMicSlotsForRoom(target.room);
-          const slot = slots.find((s) => s.slotNumber === target.micSlot);
-          const slotNum = target.micSlot;
-          if (slot) slot.user = null;
-          target.micSlot = null;
-          target.isVoice = false;
-          target.isSpeaking = false;
-
-          io.to(target.room).emit('micSlotsUpdated', slots);
+        if (target && (target.micSlot !== null || target.isVoice)) {
+          const slotNum = target.micSlot || 1;
+          releaseUserMic(target, target.room);
           io.to(target.id).emit('micRevokedByAdmin', { adminName: admin.username });
-          io.to(target.room).emit('userLeftVoice', { userId: target.id, username: target.username });
-          broadcastRoomsUpdate();
 
           logMonitorEvent('mic_pull', `قام [${admin.role.toUpperCase()}] ${admin.username} بسحب المايك من ${target.username}`, admin.username, target.username);
 
@@ -8200,13 +8352,55 @@ io.on('connection', (socket) => {
       case 'mute': {
         if (target) {
           target.isTextMuted = !target.isTextMuted;
-          if (target.isTextMuted && target.micSlot !== null) {
+          if (target.isTextMuted) {
             target.isMuted = true;
+            target.isSpeaking = false;
+            io.to(target.id).emit('forceVoiceMuteState', { muted: true, by: admin.username });
+          } else if (!target.isVoiceMutedByAdmin) {
+            target.isMuted = false;
+            io.to(target.id).emit('forceVoiceMuteState', { muted: false, by: admin.username });
+          }
+          if (target.micSlot !== null || target.isVoice) {
+            io.to(target.room).emit('micSlotsUpdated', getMicSlotsForRoom(target.room));
+            io.to(target.room).emit('userVoiceStateChanged', {
+              userId: target.id,
+              isMuted: target.isMuted,
+              isSpeaking: target.isSpeaking
+            });
           }
           logMonitorEvent('mute', `${target.isTextMuted ? 'إسكات' : 'إلغاء إسكات'} ${target.username} بواسطة [${admin.role.toUpperCase()}] ${admin.username}`, admin.username, target.username);
           io.to(target.id).emit('systemAlert', target.isTextMuted ? `تم فرض الإسكات عليك بواسطة ${admin.username}.` : `تم رفع الإسكات عنك بواسطة ${admin.username}.`);
           broadcastRoomUsers(target.room);
           socket.emit('systemAlert', `تم ${target.isTextMuted ? 'إسكات' : 'إلغاء إسكات'} ${target.username} بنجاح.`);
+        }
+        break;
+      }
+
+      // كتم / إلغاء كتم المايك الصوتي عن العضو فقط دون إسكات الكتابة (Mute Voice Only)
+      case 'muteVoice': {
+        if (target) {
+          const nextMuted = typeof value === 'boolean' ? value : !Boolean(target.isVoiceMutedByAdmin || target.isMuted);
+          target.isVoiceMutedByAdmin = nextMuted;
+          target.isMuted = nextMuted;
+          if (nextMuted) target.isSpeaking = false;
+          io.to(target.id).emit('forceVoiceMuteState', { muted: nextMuted, by: admin.username });
+          if (target.micSlot !== null || target.isVoice) {
+            io.to(target.room).emit('micSlotsUpdated', getMicSlotsForRoom(target.room));
+            io.to(target.room).emit('userVoiceStateChanged', {
+              userId: target.id,
+              isMuted: target.isMuted,
+              isSpeaking: target.isSpeaking
+            });
+          }
+          broadcastRoomUsers(target.room);
+          io.to(target.id).emit(
+            'systemAlert',
+            nextMuted
+              ? `تم كتم المايك الصوتي عنك بواسطة الإدارة (${admin.username}).`
+              : `تم فك كتم المايك الصوتي عنك بواسطة الإدارة (${admin.username}).`
+          );
+          logMonitorEvent('mute', `${nextMuted ? 'كتم المايك الصوتي عن' : 'فك كتم المايك الصوتي عن'} ${target.username} بواسطة ${admin.username}`, admin.username, target.username);
+          socket.emit('systemAlert', `تم ${nextMuted ? 'كتم المايك عن' : 'فك كتم المايك عن'} ${target.username} بنجاح.`);
         }
         break;
       }
@@ -8246,12 +8440,9 @@ io.on('connection', (socket) => {
           persistActiveSessions();
 
           io.to(target.id).emit('kickedByAdmin', { reason: kickReason, by: admin.username });
-          
-          if (target.micSlot !== null) {
-            const slots = getMicSlotsForRoom(target.room);
-            const slot = slots.find((s) => s.slotNumber === target.micSlot);
-            if (slot) slot.user = null;
-            io.to(target.room).emit('micSlotsUpdated', slots);
+          cleanupUserLiveState(target.id);
+          if (target.micSlot !== null || target.isVoice) {
+            releaseUserMic(target, target.room);
           }
 
           // Disconnect the target socket cleanly so they cannot immediately spam
@@ -8372,11 +8563,9 @@ io.on('connection', (socket) => {
         );
         liveToKick.forEach((kUser) => {
           io.to(kUser.id).emit('kickedByAdmin', { reason: `تم حظرك نهائياً وحظر بصمة جهازك وعنوان الـ IP من دخول حسان برو بقرار إداري (${banReason}).`, by: admin.username });
-          if (kUser.micSlot !== null) {
-            const slots = getMicSlotsForRoom(kUser.room);
-            const slot = slots.find((s) => s.slotNumber === kUser.micSlot);
-            if (slot) slot.user = null;
-            io.to(kUser.room).emit('micSlotsUpdated', slots);
+          cleanupUserLiveState(kUser.id);
+          if (kUser.micSlot !== null || kUser.isVoice) {
+            releaseUserMic(kUser, kUser.room);
           }
           const kSock = io.sockets.sockets.get(kUser.id);
           if (kSock) {
@@ -8479,7 +8668,17 @@ io.on('connection', (socket) => {
       // فك الإسكات الصوتي (Unmute Voice)
       case 'unmuteVoice': {
         if (target) {
+          target.isVoiceMutedByAdmin = false;
           target.isMuted = false;
+          io.to(target.id).emit('forceVoiceMuteState', { muted: false, by: admin.username });
+          if (target.micSlot !== null || target.isVoice) {
+            io.to(target.room).emit('micSlotsUpdated', getMicSlotsForRoom(target.room));
+            io.to(target.room).emit('userVoiceStateChanged', {
+              userId: target.id,
+              isMuted: target.isMuted,
+              isSpeaking: target.isSpeaking
+            });
+          }
           broadcastRoomUsers(target.room);
           io.to(target.id).emit('systemAlert', `تم فك الإسكات الصوتي عنك بواسطة الإدارة (${admin.username}).`);
           logMonitorEvent('mute', `فك الإسكات الصوتي عن ${target.username} بواسطة ${admin.username}`, admin.username, target.username);
@@ -8951,7 +9150,9 @@ io.on('connection', (socket) => {
         if (target) {
           target.isTextMuted = true;
           target.isMuted = true;
+          target.isVoiceMutedByAdmin = true;
           target.isJailed = true;
+          cleanupUserLiveState(target.id);
           moveConnectedUserToRoom(target, 'سجن حسان برو', {
             actorUsername: admin.username,
             announceRooms: true,
@@ -9000,6 +9201,7 @@ io.on('connection', (socket) => {
         if (target) {
           target.isTextMuted = false;
           target.isMuted = false;
+          target.isVoiceMutedByAdmin = false;
           target.isJailed = false;
           moveConnectedUserToRoom(target, 'الغرفة العامة', {
             actorUsername: admin.username,
@@ -10828,15 +11030,51 @@ io.on('connection', (socket) => {
   // =========================================================================
   // LIVE VIDEO & AUDIO BROADCAST SYSTEM (بث مباشر فيديو وصوت حقيقي للغرفة)
   // =========================================================================
-  socket.on('startLiveBroadcast', ({ room, title }: { room: string; title?: string }) => {
+  socket.on('startLiveBroadcast', ({ room, title }: { room: string; title?: string }, callback?: (res: { ok: boolean; error?: string; broadcast?: any }) => void) => {
     const user = users.find((u) => u.id === socket.id);
-    if (!user) return;
+    const fail = (errMsg: string) => {
+      socket.emit('liveBroadcastError', errMsg);
+      socket.emit('systemAlert', errMsg);
+      if (typeof callback === 'function') callback({ ok: false, error: errMsg });
+    };
+
+    if (!user) {
+      fail('يجب تسجيل الدخول أولاً لبدء البث المباشر.');
+      return;
+    }
+    if (user.isJailed || user.room === 'خارج الغرف') {
+      fail('لا يمكنك بدء البث المباشر حالياً.');
+      return;
+    }
     if (!isSupremeHassan(user) && user.role !== 'admin' && user.role !== 'super' && !hasPermission(user.role, 'canStartLive')) {
-      socket.emit('systemAlert', 'عفواً، صلاحية بدء البث المباشر غير متاحة لرتبتك الحالية.');
+      fail('عفواً، صلاحية بدء البث المباشر غير متاحة لرتبتك الحالية.');
       return;
     }
 
     const targetRoom = room || user.room || 'الغرفة العامة';
+    const existingLive = activeLiveBroadcasts.get(targetRoom);
+    if (existingLive && existingLive.broadcasterId !== socket.id) {
+      const existingSocketAlive = io.sockets.sockets.get(existingLive.broadcasterId)?.connected;
+      const existingHolder = users.find((u) => u.id === existingLive.broadcasterId);
+      const actorOutranks =
+        isSupremeHassan(user) ||
+        (existingHolder ? getRoleLevel(user.role) > getRoleLevel(existingHolder.role) : user.role === 'admin');
+      if (existingSocketAlive && !actorOutranks) {
+        fail(`يوجد بث مباشر نشط حالياً بواسطة [${existingLive.broadcasterUsername}] في هذه الغرفة.`);
+        return;
+      }
+      activeLiveBroadcasts.delete(targetRoom);
+      io.to(targetRoom).emit('liveBroadcastEnded', {
+        room: targetRoom,
+        broadcasterUsername: existingLive.broadcasterUsername
+      });
+    }
+
+    // Drop any mic slot held by the broadcaster so mic audio & live audio never collide
+    if (user.micSlot !== null || user.isVoice) {
+      releaseUserMic(user, user.room);
+    }
+
     const broadcast: RoomLiveBroadcast = {
       broadcasterId: socket.id,
       broadcasterUsername: user.username,
@@ -10850,48 +11088,37 @@ io.on('connection', (socket) => {
     };
 
     activeLiveBroadcasts.set(targetRoom, broadcast);
-    io.to(targetRoom).emit('liveBroadcastStarted', {
-      broadcasterId: socket.id,
-      broadcasterUsername: user.username,
-      broadcasterDisplayName: user.displayName || user.username,
-      broadcasterAvatar: user.avatarUrl,
-      broadcasterFlag: user.flag,
-      room: targetRoom,
-      title: broadcast.title,
-      startedAt: broadcast.startedAt,
-      viewersCount: 0
-    });
+    const serialized = serializeLiveBroadcast(broadcast)!;
+    io.to(targetRoom).emit('liveBroadcastStarted', serialized);
+    if (typeof callback === 'function') callback({ ok: true, broadcast: serialized });
 
     logMonitorEvent('role', `بدأ [${user.username}] بثاً لايف مباشر (فيديو وصوت) في غرفة [${targetRoom}]`, user.username);
   });
 
-  socket.on('endLiveBroadcast', ({ room }: { room: string }) => {
+  socket.on('endLiveBroadcast', ({ room }: { room?: string } = {}) => {
     const user = users.find((u) => u.id === socket.id);
     const targetRoom = room || (user ? user.room : 'الغرفة العامة');
     const broadcast = activeLiveBroadcasts.get(targetRoom);
-    if (broadcast && (broadcast.broadcasterId === socket.id || (user && (isSupremeHassan(user) || user.role === 'admin' || user.role === 'super')))) {
+    if (
+      broadcast &&
+      (broadcast.broadcasterId === socket.id ||
+        (user &&
+          (broadcast.broadcasterUsername.toLowerCase() === user.username.toLowerCase() ||
+            isSupremeHassan(user) ||
+            user.role === 'admin' ||
+            user.role === 'super' ||
+            hasPermission(user.role, 'canLockVoice') ||
+            getRoleLevel(user.role) >= 75)))
+    ) {
       activeLiveBroadcasts.delete(targetRoom);
       io.to(targetRoom).emit('liveBroadcastEnded', { room: targetRoom, broadcasterUsername: broadcast.broadcasterUsername });
     }
   });
 
-  socket.on('getLiveBroadcast', ({ room }: { room: string }) => {
-    const targetRoom = room || 'الغرفة العامة';
-    const broadcast = activeLiveBroadcasts.get(targetRoom);
-    if (broadcast) {
-      socket.emit('currentLiveBroadcast', {
-        broadcasterId: broadcast.broadcasterId,
-        broadcasterUsername: broadcast.broadcasterUsername,
-        broadcasterAvatar: broadcast.broadcasterAvatar,
-        broadcasterFlag: broadcast.broadcasterFlag,
-        room: broadcast.room,
-        title: broadcast.title,
-        startedAt: broadcast.startedAt,
-        viewersCount: broadcast.viewers.length
-      });
-    } else {
-      socket.emit('currentLiveBroadcast', null);
-    }
+  socket.on('getLiveBroadcast', ({ room }: { room?: string } = {}) => {
+    const user = users.find((u) => u.id === socket.id);
+    const targetRoom = room || user?.room || 'الغرفة العامة';
+    socket.emit('currentLiveBroadcast', serializeLiveBroadcast(activeLiveBroadcasts.get(targetRoom)));
   });
 
   socket.on('joinLiveViewer', ({ room }: { room: string }) => {
@@ -10909,6 +11136,8 @@ io.on('connection', (socket) => {
           viewerUsername: viewer?.username || 'مشاهد'
         });
       }
+    } else {
+      socket.emit('currentLiveBroadcast', null);
     }
   });
 
@@ -10928,14 +11157,21 @@ io.on('connection', (socket) => {
   socket.on('liveSignal', ({ targetId, signal }: { targetId: string; signal: any }) => {
     if (!targetId || !signal) return;
     const sender = users.find((u) => u.id === socket.id);
-    io.to(targetId).emit('liveSignal', { senderId: socket.id, senderUsername: sender?.username || 'المستخدم', signal });
+    if (!sender) return;
+    const isAuthorizedLivePeer = Array.from(activeLiveBroadcasts.values()).some(
+      (b) =>
+        (b.broadcasterId === socket.id && b.viewers.includes(targetId)) ||
+        (b.broadcasterId === targetId && (b.viewers.includes(socket.id) || sender.room === b.room))
+    );
+    if (!isAuthorizedLivePeer) return;
+    io.to(targetId).emit('liveSignal', { senderId: socket.id, senderUsername: sender.username, signal });
   });
 
   socket.on('requestLiveAudioFallback', ({ room }: { room: string }) => {
     const viewer = users.find((u) => u.id === socket.id);
     const targetRoom = room || viewer?.room || 'الغرفة العامة';
     const broadcast = activeLiveBroadcasts.get(targetRoom);
-    if (!broadcast || !broadcast.broadcasterId) return;
+    if (!broadcast || !broadcast.broadcasterId || broadcast.broadcasterId === socket.id) return;
     io.to(broadcast.broadcasterId).emit('enableLiveAudioFallback', { requesterId: socket.id });
   });
 
@@ -10957,20 +11193,20 @@ io.on('connection', (socket) => {
     if (!sender || !frameData) return;
     const targetRoom = room || sender.room || 'الغرفة العامة';
     const broadcast = activeLiveBroadcasts.get(targetRoom);
-    if (broadcast && broadcast.broadcasterId === socket.id) {
-      broadcast.viewers.forEach((viewerId) => {
-        if (viewerId !== socket.id) {
-          io.to(viewerId).emit('liveVideoFrame', { broadcasterUsername: sender.username, frameData });
-        }
-      });
-      return;
-    }
-    socket.to(targetRoom).emit('liveVideoFrame', { broadcasterUsername: sender.username, frameData });
+    if (!broadcast || broadcast.broadcasterId !== socket.id) return;
+    broadcast.viewers.forEach((viewerId) => {
+      if (viewerId !== socket.id) {
+        io.to(viewerId).emit('liveVideoFrame', { broadcasterUsername: sender.username, frameData });
+      }
+    });
   });
 
   socket.on('liveReaction', ({ room, emoji }: { room: string; emoji: string }) => {
     const user = users.find((u) => u.id === socket.id);
-    io.to(room).emit('liveReactionReceived', { emoji, username: user?.username || 'عضو' });
+    if (!user) return;
+    const targetRoom = room || user.room;
+    if (!activeLiveBroadcasts.has(targetRoom)) return;
+    io.to(targetRoom).emit('liveReactionReceived', { emoji, username: user.username });
   });
 
   // Disconnect handler: Preserves presence across phone screen locks & background sleep
@@ -11000,22 +11236,18 @@ io.on('connection', (socket) => {
 
     // Only purge user if they EXPLICITLY triggered logout
     if (session && session.isExplicitlyLoggedOut) {
+      cleanupUserLiveState(socket.id);
       const index = users.findIndex((u) => u.id === socket.id || u.username.toLowerCase() === session!.user.username.toLowerCase());
       if (index !== -1) {
         const user = users.splice(index, 1)[0];
 
-        if (user.micSlot !== null) {
-          const slots = getMicSlotsForRoom(user.room);
-          const slot = slots.find((s) => s.slotNumber === user.micSlot);
-          if (slot) slot.user = null;
-          io.to(user.room).emit('micSlotsUpdated', slots);
+        if (user.micSlot !== null || user.isVoice) {
+          releaseUserMic(user, user.room);
+        } else {
+          broadcastRoomsUpdate();
         }
 
         logMonitorEvent('leave', `سجل ${user.username} خروجاً رسمياً من الدردشة`, user.username);
-
-        if (user.isVoice) {
-          io.to(user.room).emit('userLeftVoice', { userId: socket.id, username: user.username });
-        }
 
         chatRooms.forEach((r) => {
           broadcastRoomUsers(r.id);
@@ -11078,9 +11310,17 @@ io.on('connection', (socket) => {
           const currentU = users.find((u) => u.username.toLowerCase() === uName.toLowerCase());
           if (!currentU || currentU.id === disconnectedSocketId || currentU.presenceState === 'offline') {
             // Still not reconnected after micGraceMs: safely free the mic slot
-            if (currentU) {
+            if (currentU && currentU.room === slotRoom) {
               currentU.micSlot = null;
               currentU.isVoice = false;
+              currentU.isSpeaking = false;
+            }
+            for (const sess of activeSessions.values()) {
+              if (sess.user && sess.user.username.toLowerCase() === uName.toLowerCase()) {
+                sess.user.micSlot = null;
+                sess.user.isVoice = false;
+                sess.user.isSpeaking = false;
+              }
             }
             const slots = getMicSlotsForRoom(slotRoom);
             const slot = slots.find((s) => s.slotNumber === slotNum);
@@ -11088,6 +11328,8 @@ io.on('connection', (socket) => {
               slot.user = null;
               io.to(slotRoom).emit('micSlotsUpdated', slots);
               io.to(slotRoom).emit('userLeftVoice', { userId: disconnectedSocketId, username: uName, slotNumber: slotNum });
+              broadcastRoomUsers(slotRoom);
+              broadcastRoomsUpdate();
             }
           }
         }, micGraceMs);
@@ -11100,18 +11342,7 @@ io.on('connection', (socket) => {
     }
 
     // Clean up active live broadcast if this socket was broadcaster or viewer
-    for (const [rId, live] of activeLiveBroadcasts.entries()) {
-      if (live.broadcasterId === socket.id) {
-        activeLiveBroadcasts.delete(rId);
-        io.to(rId).emit('liveBroadcastEnded', { room: rId, broadcasterUsername: live.broadcasterUsername });
-      } else if (live.viewers.includes(socket.id)) {
-        live.viewers = live.viewers.filter((id) => id !== socket.id);
-        io.to(rId).emit('liveViewerCountUpdated', { room: rId, count: live.viewers.length });
-        if (live.broadcasterId) {
-          io.to(live.broadcasterId).emit('liveViewerLeft', { viewerId: socket.id });
-        }
-      }
-    }
+    cleanupUserLiveState(socket.id);
 
     // Real-time online count & presence update (ghost-filtered)
     broadcastAllUsers();
@@ -11129,11 +11360,9 @@ setInterval(() => {
       const uIdx = users.findIndex((u) => u.username.toLowerCase() === session.user.username.toLowerCase());
       if (uIdx !== -1) {
         const removed = users.splice(uIdx, 1)[0];
-        if (removed.micSlot !== null) {
-          const slots = getMicSlotsForRoom(removed.room);
-          const slot = slots.find((s) => s.slotNumber === removed.micSlot);
-          if (slot) slot.user = null;
-          io.to(removed.room).emit('micSlotsUpdated', slots);
+        cleanupUserLiveState(removed.id);
+        if (removed.micSlot !== null || removed.isVoice) {
+          releaseUserMic(removed, removed.room);
         }
         broadcastRoomUsers(removed.room);
         changed = true;
@@ -11152,11 +11381,9 @@ setInterval(() => {
     const lastActive = u.lastActiveTime || u.joinedAt || 0;
     if (!isSocketAlive && lastActive < thirtyMinsAgo) {
       const removed = users.splice(i, 1)[0];
-      if (removed.micSlot !== null) {
-        const slots = getMicSlotsForRoom(removed.room);
-        const slot = slots.find((s) => s.slotNumber === removed.micSlot);
-        if (slot) slot.user = null;
-        io.to(removed.room).emit('micSlotsUpdated', slots);
+      cleanupUserLiveState(removed.id);
+      if (removed.micSlot !== null || removed.isVoice) {
+        releaseUserMic(removed, removed.room);
       }
       broadcastRoomUsers(removed.room);
       changed = true;
@@ -11165,6 +11392,7 @@ setInterval(() => {
 
   if (changed) {
     broadcastAllUsers();
+    broadcastRoomsUpdate();
   }
 }, 60000);
 

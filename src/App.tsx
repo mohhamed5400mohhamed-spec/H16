@@ -77,8 +77,9 @@ import {
   Repeat
 } from 'lucide-react';
 import confetti from './utils/confetti';
-import { AudioMeshManager, RemoteVoicePeer } from './utils/audioMesh';
+import { AudioMeshManager, RemoteVoicePeer, SharedMusicState } from './utils/audioMesh';
 import { LiveBroadcastAudioManager } from './utils/liveBroadcastMedia';
+import { MusicShareMiniPlayer } from './components/MusicShareMiniPlayer';
 import type { RoomStatData } from './components/RoomStatsPieChart';
 import type { LikesThresholdSettings, ServerSecuritySettings, MessageRetentionLimits } from './components/AdminControlSuite';
 import { VoiceRecorder, VoicePlayer, VoiceNoteData } from './components/VoiceNoteModule';
@@ -2084,6 +2085,15 @@ export default function App() {
   const [audioManager, setAudioManager] = useState<AudioMeshManager | null>(null);
   const audioManagerRef = useRef<AudioMeshManager | null>(null);
   const [micVolume, setMicVolume] = useState(0);
+  const musicFileInputRef = useRef<HTMLInputElement | null>(null);
+  const [sharedMusicState, setSharedMusicState] = useState<SharedMusicState>({
+    isActive: false,
+    isPlaying: false,
+    trackName: '',
+    currentTime: 0,
+    duration: 0,
+    volume: 75
+  });
 
   // Control Panel Tabs & Filter State
   const [controlPanelTab, setControlPanelTab] = useState<'moderation' | 'roomControls' | 'bans' | 'broadcast' | 'stats' | 'words' | 'matrix' | 'logs'>('moderation');
@@ -2240,7 +2250,7 @@ export default function App() {
     const actorLevel = getRoleLevel(actor.role);
 
     if (target) {
-      if (target.id === actor.id && ['kick', 'ban', 'mute', 'deleteAvatar', 'jailUser'].includes(action)) {
+      if (target.id === actor.id && ['kick', 'ban', 'mute', 'muteVoice', 'deleteAvatar', 'jailUser'].includes(action)) {
         return { allowed: false, reason: 'لا يمكنك تطبيق هذا الإجراء على نفسك.' };
       }
       if (target.username.toLowerCase() === actor.username.toLowerCase() && ['kick', 'ban', 'jailUser'].includes(action)) {
@@ -2269,6 +2279,7 @@ export default function App() {
       kick: 'canKick',
       mute: 'canMute',
       unmuteText: 'canMute',
+      muteVoice: 'canMuteVoice',
       unmuteVoice: 'canMuteVoice',
       pullMic: 'canPullMic',
       warn: 'canWarn',
@@ -4482,9 +4493,16 @@ export default function App() {
       currentUserRef.current = user;
       roomEntryTimestampRef.current = Date.now();
       audioManagerRef.current?.resetForRoomSwitch();
+      audioManagerRef.current?.setAdminMuted(Boolean(user.isVoiceMutedByAdmin));
+      if (!liveMediaStreamRef.current) {
+        mediaSessionManager.exitCallMode();
+      }
       setVoiceAutoplayBlocked(false);
       // Clean Room Mode: Fresh start when entering any room
       setMessages([]);
+      if (user.room && user.room !== 'خارج الغرف') {
+        s.emit('getLiveBroadcast', { room: user.room });
+      }
     });
 
     s.on('profileUpdated', ({ user }: { user: User }) => {
@@ -4619,6 +4637,15 @@ export default function App() {
       if (typeof document === 'undefined' || !document.hidden) {
         s.emit('userPresenceChange', { state: 'online' });
       }
+      audioManagerRef.current?.setAdminMuted(Boolean(user.isVoiceMutedByAdmin));
+      // If user reloaded page while previously on a mic slot, drop dead mic slot since MediaStream does not survive reload
+      if (user.micSlot !== null && !audioManagerRef.current?.isInVoice) {
+        s.emit('dropMic');
+        setCurrentUser((prev) => (prev ? { ...prev, micSlot: null, isVoice: false, isSpeaking: false } : null));
+      }
+      if (user.room && user.room !== 'خارج الغرف') {
+        s.emit('getLiveBroadcast', { room: user.room });
+      }
     });
 
     s.on('sessionRestoreFailed', (data?: { reason?: string }) => {
@@ -4734,10 +4761,25 @@ export default function App() {
 
     s.on('micSlotsUpdated', (slots: MicSlot[]) => {
       setMicSlots(slots);
+      setMicActionSlot((prev) => {
+        if (!prev) return null;
+        const matched = slots.find((item) => item.slotNumber === prev.slotNumber);
+        return matched ? { slotNumber: matched.slotNumber, slotUser: matched.user } : null;
+      });
       if (currentUserRef.current) {
         const mySlot = slots.find((slotItem) => slotItem.user && (slotItem.user.id === s.id || slotItem.user.username === currentUserRef.current?.username));
         const newSlotNum = mySlot ? mySlot.slotNumber : null;
-        setCurrentUser((prev) => (prev ? { ...prev, micSlot: newSlotNum, isVoice: newSlotNum !== null } : null));
+        setCurrentUser((prev) =>
+          prev
+            ? {
+                ...prev,
+                micSlot: newSlotNum,
+                isVoice: newSlotNum !== null,
+                isMuted: mySlot?.user ? Boolean(mySlot.user.isMuted) : Boolean(prev.isTextMuted || prev.isVoiceMutedByAdmin),
+                isSpeaking: mySlot?.user ? Boolean(mySlot.user.isSpeaking) : false
+              }
+            : null
+        );
       }
     });
 
@@ -5079,7 +5121,29 @@ export default function App() {
       setActiveRoomLiveBroadcast(broadcast);
       if (broadcast) {
         setLiveViewerCount(broadcast.viewersCount || 0);
+      } else {
+        liveAudioManagerRef.current?.stop();
+        setIsWatchingLive(false);
+        setIsLiveViewerMuted(false);
+        setLiveAudioBlocked(false);
+        setLiveRemoteVideoFrame(null);
       }
+    });
+
+    s.on('liveBroadcastError', (errMsg: string) => {
+      liveAudioManagerRef.current?.stop();
+      if (liveFrameIntervalRef.current) {
+        clearInterval(liveFrameIntervalRef.current);
+        liveFrameIntervalRef.current = null;
+      }
+      if (liveMediaStreamRef.current) {
+        liveMediaStreamRef.current.getTracks().forEach((track) => track.stop());
+        liveMediaStreamRef.current = null;
+        setLiveMediaStream(null);
+      }
+      setIsBroadcastingLive(false);
+      setIsWatchingLive(false);
+      showToast(errMsg || 'تعذر بدء البث المباشر', 'error');
     });
 
     s.on('liveViewerCountUpdated', ({ count }: { count: number }) => {
@@ -5108,7 +5172,33 @@ export default function App() {
       showToast(msg, 'info');
     });
 
+    s.on('forceVoiceMuteState', ({ muted }: { muted: boolean; by?: string }) => {
+      audioManagerRef.current?.setAdminMuted(Boolean(muted));
+      setCurrentUser((prev) =>
+        prev
+          ? {
+              ...prev,
+              isMuted: Boolean(muted),
+              isSpeaking: false,
+              isVoiceMutedByAdmin: Boolean(muted)
+            }
+          : null
+      );
+    });
+
     s.on('micRevokedByAdmin', ({ adminName }: { adminName: string }) => {
+      audioManagerRef.current?.leaveVoice();
+      mediaSessionManager.exitCallMode();
+      setCurrentUser((prev) =>
+        prev
+          ? {
+              ...prev,
+              micSlot: null,
+              isVoice: false,
+              isSpeaking: false
+            }
+          : null
+      );
       sounds.playVoiceLeave();
       showToast(`تم سحب المايك منك بواسطة الإداري (${adminName}).`, 'info');
     });
@@ -5231,6 +5321,11 @@ export default function App() {
     });
 
     s.on('micError', (errMsg: string) => {
+      audioManagerRef.current?.leaveVoice();
+      mediaSessionManager.exitCallMode();
+      setCurrentUser((prev) =>
+        prev ? { ...prev, micSlot: null, isVoice: false, isSpeaking: false } : null
+      );
       showToast(errMsg || 'تعذر الصعود إلى المايك', 'error');
       sounds.playGeneralAlertPing();
     });
@@ -5277,6 +5372,7 @@ export default function App() {
     audioManagerRef.current = manager;
     manager.onVolumeChange = (vol) => setMicVolume(vol);
     manager.onAutoplayBlocked = (blocked) => setVoiceAutoplayBlocked(blocked);
+    manager.onSharedMusicChange = (st) => setSharedMusicState(st);
     manager.onError = (err) => {
       sounds.playError();
       showToast(err, 'error');
@@ -5432,8 +5528,9 @@ export default function App() {
     setForcedLogoutInfo(null);
     if (audioManager) {
       audioManager.dropMicSlot();
-      audioManager.leaveVoice();
+      audioManager.resetForRoomSwitch();
     }
+    mediaSessionManager.exitCallMode();
     handleStopLiveBroadcast();
     const token = localStorage.getItem('soqoor_session_token');
     socket?.emit('explicitLogout', { sessionToken: token || undefined });
@@ -5460,6 +5557,7 @@ export default function App() {
       audioManager.dropMicSlot();
       audioManager.resetForRoomSwitch();
     }
+    mediaSessionManager.exitCallMode();
     setVoiceAutoplayBlocked(false);
     if (isBroadcastingLive || isWatchingLive || liveMediaStreamRef.current) {
       handleStopLiveBroadcast();
@@ -5472,7 +5570,7 @@ export default function App() {
     setTypingUsers([]);
     const curRoom = currentUser?.room || 'الغرفة العامة';
     socket?.emit('leaveRoom', { room: curRoom });
-    setCurrentUser((prev) => (prev ? { ...prev, room: 'خارج الغرف', micSlot: null, isVoice: false } : null));
+    setCurrentUser((prev) => (prev ? { ...prev, room: 'خارج الغرف', micSlot: null, isVoice: false, isSpeaking: false } : null));
     setRosterUsers([]);
     setAllConnectedUsers((prev) => {
       if (!currentUser) return prev;
@@ -5638,6 +5736,11 @@ export default function App() {
         sounds.playError();
         setRoomPasswordError('كلمة المرور غير صحيحة، يرجى إعادة المحاولة');
         return;
+      }
+      if (audioManager?.isInVoice || currentUser?.micSlot !== null) {
+        audioManager?.dropMicSlot();
+        mediaSessionManager.exitCallMode();
+        setCurrentUser((prev) => (prev ? { ...prev, micSlot: null, isVoice: false, isSpeaking: false } : null));
       }
       if (isBroadcastingLive || isWatchingLive || liveMediaStreamRef.current) {
         handleStopLiveBroadcast();
@@ -5817,8 +5920,18 @@ export default function App() {
   };
 
   // Private 1-on-1 Call Handlers (مكالمات الخاص الصوتية والمرئية)
+  const prepareHardwareForPrivateCall = () => {
+    if (audioManager?.isInVoice || currentUser?.micSlot !== null) {
+      handleDropMic();
+    }
+    if (isBroadcastingLive || isWatchingLive || liveMediaStreamRef.current) {
+      handleStopLiveBroadcast();
+    }
+  };
+
   const handleStartPmCall = (callType: 'audio' | 'video') => {
     if (!socket || !selectedPmUser || !currentUser) return;
+    prepareHardwareForPrivateCall();
     socket.emit('pmCallOffer', {
       toId: selectedPmUser.id,
       toUsername: selectedPmUser.username,
@@ -5840,6 +5953,7 @@ export default function App() {
 
   const handleAcceptIncomingCall = () => {
     if (!socket || !incomingCall) return;
+    prepareHardwareForPrivateCall();
     socket.emit('pmCallAnswer', {
       callId: incomingCall.callId,
       toId: incomingCall.fromUser.id,
@@ -6154,22 +6268,30 @@ export default function App() {
 
     const currentSlot = micSlots.find((s) => s.slotNumber === slotNumber);
     if (currentSlot?.user) {
-      if (currentSlot.user.id === currentUser.id) {
+      if (currentSlot.user.id === currentUser.id || currentSlot.user.username === currentUser.username) {
+        if (currentUser.isVoiceMutedByAdmin || audioManager.isAdminMuted) {
+          sounds.playError();
+          showToast('🔇 المايك مكتوم عنك من قبل الإدارة ولا يمكنك فتحه حالياً.', 'error');
+          return;
+        }
         const isMuted = audioManager.toggleMute();
         sounds.playToggleMute(isMuted);
         showToast(isMuted ? 'تم كتم المايك الخاص بك 🔇' : 'تم تفعيل المايك 🎙️', 'info');
       } else {
-        // If Admin/Super/Supreme clicks occupied mic: offer option to Pull Mic!
-        if (currentUser.role === 'hassan' || currentUser.role === 'admin' || currentUser.role === 'super' || getRoleLevel(currentUser.role) >= 75) {
+        // If Admin/Super/Supreme/authorized moderator clicks occupied mic: offer option to Pull Mic!
+        const canPull =
+          currentUser.role === 'hassan' ||
+          currentUser.role === 'admin' ||
+          currentUser.role === 'super' ||
+          hasUserPermission(currentUser, 'canPullMic') ||
+          getRoleLevel(currentUser.role) >= 75;
+        if (canPull) {
           const occupiedUsername = currentSlot.user.username;
           openAppConfirm(
             'سحب المايك',
             `المايك مأخوذ من قبل [${occupiedUsername}]. هل تريد سحب المايك منه كإداري؟`,
             () => {
-              socket.emit('adminAction', {
-                action: 'pullMic',
-                targetUsername: occupiedUsername
-              });
+              handleAdminAction('pullMic', occupiedUsername);
             }
           );
         } else {
@@ -6179,12 +6301,18 @@ export default function App() {
       return;
     }
 
-    const ok = await audioManager.takeMicSlot(slotNumber);
-    if (ok) {
+    const result = await audioManager.takeMicSlot(slotNumber);
+    if (result.ok) {
       mediaSessionManager.enterCallMode();
       sounds.playVoiceJoin();
       showToast(`صعدت الآن إلى المايك رقم (${slotNumber}) 🎙️`, 'success');
       confetti({ particleCount: 30, spread: 50 });
+    } else {
+      mediaSessionManager.exitCallMode();
+      if (result.error) {
+        sounds.playError();
+        showToast(result.error, 'error');
+      }
     }
   };
 
@@ -6197,9 +6325,85 @@ export default function App() {
       socket.emit('dropMic');
     }
     mediaSessionManager.exitCallMode();
-    setCurrentUser((prev) => (prev ? { ...prev, micSlot: null, isVoice: false } : null));
+    setSharedMusicState((prev) => ({
+      ...prev,
+      isActive: false,
+      isPlaying: false,
+      trackName: '',
+      currentTime: 0,
+      duration: 0
+    }));
+    setCurrentUser((prev) =>
+      prev
+        ? {
+            ...prev,
+            micSlot: null,
+            isVoice: false,
+            isMuted: Boolean(prev.isTextMuted || prev.isVoiceMutedByAdmin),
+            isSpeaking: false
+          }
+        : null
+    );
     sounds.playVoiceLeave();
     showToast('تم النزول من المايك بنجاح 👋', 'info');
+  };
+
+  // Open device storage picker to share music / video audio on room mic
+  const handleOpenMusicPicker = () => {
+    const mgr = audioManagerRef.current || audioManager;
+    if (!currentUser || currentUser.micSlot === null || !mgr?.isInVoice) {
+      sounds.playError();
+      showToast('يجب الصعود على المايك أولاً لمشاركة صوت الموسيقى في الغرفة 🎙️', 'error');
+      return;
+    }
+    if (currentUser.isVoiceMutedByAdmin || mgr.isAdminMuted) {
+      sounds.playError();
+      showToast('🔇 المايك مكتوم عنك من قبل الإدارة ولا يمكنك بث الموسيقى حالياً.', 'error');
+      return;
+    }
+    if (musicFileInputRef.current) {
+      musicFileInputRef.current.value = '';
+      musicFileInputRef.current.click();
+    }
+  };
+
+  const handleMusicFileSelected = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    e.target.value = '';
+    const mgr = audioManagerRef.current || audioManager;
+    if (!file || !mgr) return;
+    const ok = await mgr.startSharedMusic(file);
+    if (ok) {
+      const st = mgr.getSharedMusicState();
+      if (st.isPlaying) {
+        showToast(`تم تشغيل وبث الأغنية للغرفة: ${st.trackName} 🎵`, 'success');
+      } else {
+        showToast('تم تحميل الأغنية — اضغط زر التشغيل ▶️ في نافذة التحكم لبدء البث', 'info');
+      }
+    }
+  };
+
+  const handleToggleMicMuteUnified = () => {
+    if (!currentUser) return;
+    const mgr = audioManagerRef.current || audioManager;
+    if (currentUser.isVoiceMutedByAdmin || mgr?.isAdminMuted) {
+      sounds.playError();
+      showToast('🔇 المايك مكتوم عنك من قبل الإدارة ولا يمكنك فتحه حالياً.', 'error');
+      return;
+    }
+    const isMuted = mgr?.toggleMute() ?? false;
+    setCurrentUser((prev) => (prev ? { ...prev, isMuted } : null));
+    sounds.playToggleMute(isMuted);
+    showToast(
+      isMuted
+        ? sharedMusicState.isActive
+          ? 'تم كتم صوتك وإبقاء بث الموسيقى شغالاً 🎵🔇'
+          : 'تم كتم صوت الميكروفون 🔇'
+        : sharedMusicState.isActive
+        ? 'تم تشغيل صوتك مع بث الموسيقى 🎙️🎵'
+        : 'تم تشغيل المايك 🎙️',
+      'info'
+    );
   };
 
   // Toggle Room Speaker
@@ -6452,10 +6656,41 @@ export default function App() {
     }, 2200);
   };
 
+  const canCurrentUserStartLive = Boolean(
+    currentUser &&
+      (currentUser.role === 'hassan' ||
+        currentUser.role === 'admin' ||
+        currentUser.role === 'super' ||
+        hasUserPermission(currentUser, 'canStartLive'))
+  );
+
+  const handleWatchLiveBroadcast = () => {
+    if (!currentUser || !activeRoomLiveBroadcast) return;
+    const targetRoom = currentUser.room || 'الغرفة العامة';
+    setIsLiveViewerMuted(false);
+    setLiveAudioBlocked(false);
+    setIsWatchingLive(true);
+    pauseKeepAliveAudio();
+    liveAudioManagerRef.current?.startViewer(targetRoom, activeRoomLiveBroadcast.broadcasterId);
+    socket?.emit('joinLiveViewer', { room: targetRoom });
+  };
+
   const handleStartLiveBroadcast = async () => {
-    if (!currentUser) return;
+    if (!currentUser || !socket?.connected) {
+      showToast('يجب أن تكون متصلاً بالسيرفر لبدء البث المباشر.', 'error');
+      return;
+    }
+    if (!canCurrentUserStartLive) {
+      setShowStartLiveConfirm(false);
+      showToast('عفواً، صلاحية بدء البث المباشر غير متاحة لرتبتك الحالية.', 'error');
+      return;
+    }
     try {
       setShowStartLiveConfirm(false);
+      if (currentUser.micSlot !== null || audioManager?.isInVoice) {
+        handleDropMic();
+      }
+
       let stream: MediaStream;
       try {
         stream = await navigator.mediaDevices.getUserMedia({
@@ -6469,7 +6704,37 @@ export default function App() {
           audio: false
         });
       }
+
       const targetRoom = currentUser.room || 'الغرفة العامة';
+      const ackRes = await new Promise<{ ok: boolean; error?: string }>((resolve) => {
+        let settled = false;
+        const timer = setTimeout(() => {
+          if (!settled) {
+            settled = true;
+            resolve({ ok: true });
+          }
+        }, 5000);
+        socket.emit(
+          'startLiveBroadcast',
+          {
+            room: targetRoom,
+            title: `بث مباشر 🔴 ${currentUser.displayName || currentUser.username}`
+          },
+          (res?: { ok?: boolean; error?: string }) => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timer);
+            resolve({ ok: res?.ok !== false, error: res?.error });
+          }
+        );
+      });
+
+      if (!ackRes.ok) {
+        stream.getTracks().forEach((t) => t.stop());
+        showToast(ackRes.error || 'تعذر بدء البث المباشر حالياً.', 'error');
+        return;
+      }
+
       liveMediaStreamRef.current = stream;
       setLiveMediaStream(stream);
       setIsBroadcastingLive(true);
@@ -6489,11 +6754,6 @@ export default function App() {
         captureLiveVideoRef.current.srcObject = stream;
         captureLiveVideoRef.current.play().catch(() => {});
       }
-
-      socket?.emit('startLiveBroadcast', {
-        room: targetRoom,
-        title: `بث مباشر 🔴 ${currentUser.displayName || currentUser.username}`
-      });
 
       // Frame broadcaster for viewers (reads from always-mounted captureLiveVideoRef & liveMediaStreamRef so PiP minimize or camera flip never freezes)
       if (liveFrameIntervalRef.current) clearInterval(liveFrameIntervalRef.current);
@@ -8273,6 +8533,7 @@ export default function App() {
                   showToast('تم إرسال التسجيل الصوتي في الخاص 🎙️', 'success');
                 }}
                 onCancel={() => setIsPmRecordingVoice(false)}
+                onError={(msg) => showToast(msg, 'error')}
               />
             </div>
           ) : (
@@ -10092,16 +10353,12 @@ export default function App() {
                     <LogOut className="w-4 h-4" />
                     <span>إفلات المايك (النزول الآن) 👋</span>
                   </button>
-                ) : (currentUser.role === 'hassan' || currentUser.role === 'admin' || currentUser.role === 'super' || getRoleLevel(currentUser.role) >= 75) ? (
+                ) : (currentUser.role === 'hassan' || currentUser.role === 'admin' || currentUser.role === 'super' || hasUserPermission(currentUser, 'canPullMic') || getRoleLevel(currentUser.role) >= 75) ? (
                   <button
                     type="button"
                     onClick={() => {
                       if (micActionSlot.slotUser) {
-                        socket?.emit('adminAction', {
-                          action: 'pullMic',
-                          targetUsername: micActionSlot.slotUser.username
-                        });
-                        showToast(`تم سحب المايك من [${micActionSlot.slotUser.username}] 🚨`, 'info');
+                        handleAdminAction('pullMic', micActionSlot.slotUser.username);
                       }
                       setMicActionSlot(null);
                     }}
@@ -10112,48 +10369,74 @@ export default function App() {
                   </button>
                 ) : null}
 
-                {/* OPTION 2: Mute or Unmute Mic (كتم المايك / إلغاء الكتم) */}
+                {/* OPTION 2: Mute or Unmute Mic (كتم المايك / إلغاء الكتم) + Share Music (مشاركة صوت الموسيقى) */}
                 {(micActionSlot.slotUser?.id === currentUser.id || micActionSlot.slotUser?.username === currentUser.username) ? (
-                  <button
-                    type="button"
-                    onClick={() => {
-                      const isMuted = audioManager?.toggleMute() ?? false;
-                      sounds.playToggleMute(isMuted);
-                      showToast(isMuted ? 'تم كتم صوت الميكروفون 🔇' : 'تم تشغيل المايك 🎙️', 'info');
-                      setMicActionSlot(null);
-                    }}
-                    className="w-full py-2 px-3 bg-slate-100 hover:bg-slate-200 text-slate-800 font-bold rounded-xl flex items-center justify-center gap-2 border cursor-pointer transition-colors"
-                  >
-                    {audioManager?.isMuted ? (
-                      <>
-                        <Mic className="w-4 h-4 text-emerald-600" />
-                        <span>إلغاء كتم المايك 🎙️</span>
-                      </>
-                    ) : (
-                      <>
-                        <VolumeX className="w-4 h-4 text-rose-600" />
-                        <span>كتم صوت المايك 🔇</span>
-                      </>
-                    )}
-                  </button>
-                ) : (currentUser.role === 'hassan' || currentUser.role === 'admin' || currentUser.role === 'super' || getRoleLevel(currentUser.role) >= 75) ? (
+                  <>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        handleToggleMicMuteUnified();
+                        setMicActionSlot(null);
+                      }}
+                      className="w-full py-2 px-3 bg-slate-100 hover:bg-slate-200 text-slate-800 font-bold rounded-xl flex items-center justify-center gap-2 border cursor-pointer transition-colors"
+                    >
+                      {audioManager?.isMuted ? (
+                        <>
+                          <Mic className="w-4 h-4 text-emerald-600" />
+                          <span>إلغاء كتم المايك 🎙️</span>
+                        </>
+                      ) : (
+                        <>
+                          <VolumeX className="w-4 h-4 text-rose-600" />
+                          <span>كتم صوت المايك 🔇</span>
+                        </>
+                      )}
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setMicActionSlot(null);
+                        handleOpenMusicPicker();
+                      }}
+                      className="w-full py-2.5 px-3 bg-gradient-to-r from-amber-500 to-amber-600 hover:from-amber-600 hover:to-amber-700 text-slate-950 font-black rounded-xl flex items-center justify-center gap-2 shadow-sm cursor-pointer transition-all"
+                    >
+                      <Music className="w-4 h-4" />
+                      <span>{sharedMusicState.isActive ? 'استبدال أغنية الموسيقى 🎵' : 'مشاركة صوت الموسيقى 🎵'}</span>
+                    </button>
+                  </>
+                ) : (currentUser.role === 'hassan' || currentUser.role === 'admin' || currentUser.role === 'super' || hasUserPermission(currentUser, 'canMuteVoice') || getRoleLevel(currentUser.role) >= 75) ? (
                   <button
                     type="button"
                     onClick={() => {
                       if (micActionSlot.slotUser) {
-                        handleAdminAction('mute', micActionSlot.slotUser.username);
+                        const targetMuted = Boolean(micActionSlot.slotUser.isVoiceMutedByAdmin || micActionSlot.slotUser.isMuted);
+                        handleAdminAction(targetMuted ? 'unmuteVoice' : 'muteVoice', micActionSlot.slotUser.username);
                       }
                       setMicActionSlot(null);
                     }}
-                    className="w-full py-2 px-3 bg-slate-100 hover:bg-slate-200 text-slate-800 font-bold rounded-xl flex items-center justify-center gap-2 border cursor-pointer transition-colors"
+                    className={`w-full py-2 px-3 font-bold rounded-xl flex items-center justify-center gap-2 border cursor-pointer transition-colors ${
+                      micActionSlot.slotUser?.isVoiceMutedByAdmin || micActionSlot.slotUser?.isMuted
+                        ? 'bg-emerald-50 hover:bg-emerald-100 text-emerald-800 border-emerald-300'
+                        : 'bg-slate-100 hover:bg-slate-200 text-slate-800'
+                    }`}
                   >
-                    <VolumeX className="w-4 h-4 text-rose-600" />
-                    <span>كتم المايك عن هذا العضو 🔇</span>
+                    {micActionSlot.slotUser?.isVoiceMutedByAdmin || micActionSlot.slotUser?.isMuted ? (
+                      <>
+                        <Mic className="w-4 h-4 text-emerald-600" />
+                        <span>فك كتم المايك عن العضو 🎙️</span>
+                      </>
+                    ) : (
+                      <>
+                        <VolumeX className="w-4 h-4 text-rose-600" />
+                        <span>كتم المايك عن هذا العضو 🔇</span>
+                      </>
+                    )}
                   </button>
                 ) : null}
 
                 {/* OPTION 3: Open Profile if other member */}
-                {micActionSlot.slotUser && micActionSlot.slotUser.id !== currentUser.id && (
+                {micActionSlot.slotUser && micActionSlot.slotUser.id !== currentUser.id && micActionSlot.slotUser.username !== currentUser.username && (
                   <button
                     type="button"
                     onClick={() => {
@@ -10552,10 +10835,12 @@ export default function App() {
               if (isBroadcastingLive) {
                 setIsLiveMinimized(false);
               } else if (activeRoomLiveBroadcast) {
-                setIsWatchingLive(true);
-                socket?.emit('joinLiveViewer', { room: currentUser.room || 'الغرفة العامة' });
-              } else {
+                handleWatchLiveBroadcast();
+              } else if (canCurrentUserStartLive) {
                 setShowStartLiveConfirm(true);
+              } else {
+                sounds.playError();
+                showToast('عفواً، صلاحية بدء البث المباشر غير متاحة لرتبتك الحالية.', 'error');
               }
             }}
             className={`h-7 px-1.5 rounded-md text-white text-[10px] font-black flex items-center gap-1 shadow cursor-pointer flex-shrink-0 transition-all ${
@@ -10679,15 +10964,7 @@ export default function App() {
         {/* Active Room Live Broadcast Banner (شريط إشعار البث المباشر النشط في الغرفة) */}
         {activeRoomLiveBroadcast && !isBroadcastingLive && (
           <div
-            onClick={() => {
-              const targetRoom = currentUser.room || 'الغرفة العامة';
-              setIsLiveViewerMuted(false);
-              setLiveAudioBlocked(false);
-              setIsWatchingLive(true);
-              pauseKeepAliveAudio();
-              liveAudioManagerRef.current?.startViewer(targetRoom, activeRoomLiveBroadcast.broadcasterId);
-              socket?.emit('joinLiveViewer', { room: targetRoom });
-            }}
+            onClick={handleWatchLiveBroadcast}
             className="bg-gradient-to-r from-red-600 via-rose-600 to-red-700 text-white px-3 py-1.5 flex items-center justify-between cursor-pointer shadow-md text-xs font-bold animate-in fade-in z-25 hover:opacity-95 transition-opacity flex-shrink-0"
           >
             <div className="flex items-center gap-2">
@@ -10773,20 +11050,27 @@ export default function App() {
               <span className="w-2.5 h-2.5 rounded-full bg-white animate-pulse" />
               أنت على المايك رقم ({currentUser.micSlot})
             </span>
-            <div className="flex items-center gap-2">
+            <div className="flex items-center gap-1.5">
               <button
-                onClick={() => {
-                  const muted = audioManager?.toggleMute() ?? false;
-                  sounds.playToggleMute(muted);
-                  showToast(muted ? 'تم كتم المايك 🔇' : 'تم تفعيل المايك 🎙️', 'info');
-                }}
-                className="px-2 py-0.5 bg-emerald-900 rounded text-[11px] hover:bg-black"
+                type="button"
+                onClick={handleOpenMusicPicker}
+                className="px-2 py-0.5 bg-amber-500 hover:bg-amber-400 text-slate-950 rounded text-[11px] font-black flex items-center gap-1 cursor-pointer transition-colors"
+                title="مشاركة أو استبدال صوت موسيقى من جهازك"
               >
-                {currentUser.isMuted ? 'تفعيل المايك' : 'كتم'}
+                <Music className="w-3 h-3" />
+                <span>{sharedMusicState.isActive ? 'استبدال' : 'موسيقى'}</span>
               </button>
               <button
+                type="button"
+                onClick={handleToggleMicMuteUnified}
+                className="px-2 py-0.5 bg-emerald-900 rounded text-[11px] hover:bg-black cursor-pointer"
+              >
+                {audioManager?.isMuted || currentUser.isMuted ? 'تفعيل المايك' : 'كتم'}
+              </button>
+              <button
+                type="button"
                 onClick={handleDropMic}
-                className="px-2 py-0.5 bg-rose-600 rounded text-[11px] hover:bg-rose-700"
+                className="px-2 py-0.5 bg-rose-600 rounded text-[11px] hover:bg-rose-700 cursor-pointer"
               >
                 ترك المايك
               </button>
@@ -12769,6 +13053,7 @@ export default function App() {
               <VoiceRecorder
                 onSendVoice={(voiceData) => handleSendMessage(undefined, undefined, undefined, voiceData)}
                 onCancel={() => setIsRecordingVoice(false)}
+                onError={(msg) => showToast(msg, 'error')}
               />
             </div>
           ) : (
@@ -13373,6 +13658,11 @@ export default function App() {
                     setShowRoomPasswordText(false);
                     setRoomPasswordError(null);
                     return;
+                  }
+                  if (audioManager?.isInVoice || currentUser?.micSlot !== null) {
+                    audioManager?.dropMicSlot();
+                    mediaSessionManager.exitCallMode();
+                    setCurrentUser((prev) => (prev ? { ...prev, micSlot: null, isVoice: false, isSpeaking: false } : null));
                   }
                   if (isBroadcastingLive || isWatchingLive || liveMediaStreamRef.current) {
                     handleStopLiveBroadcast();
@@ -15059,6 +15349,7 @@ export default function App() {
                     showToast('تم نشر التسجيل الصوتي على الحائط بنجاح 🎙️✨', 'success');
                   }}
                   onCancel={() => setIsWallRecordingVoice(false)}
+                  onError={(msg) => showToast(msg, 'error')}
                 />
               </div>
             )}
@@ -16919,6 +17210,7 @@ export default function App() {
                   const canDeleteAvatar = isViewerAdmin || Boolean(hasUserPermission(currentUser, 'canDeleteAvatar'));
                   const canJail = isViewerAdmin || Boolean(hasUserPermission(currentUser, 'canJail'));
                   const canPullMic = isViewerAdmin || Boolean(hasUserPermission(currentUser, 'canPullMic'));
+                  const canMuteVoice = isViewerAdmin || Boolean(hasUserPermission(currentUser, 'canMuteVoice'));
                   const canRevealNicks = isViewerAdmin || Boolean(hasUserPermission(currentUser, 'canRevealNicks'));
                   const canEditProfile = isViewerAdmin || Boolean(hasUserPermission(currentUser, 'canEditMemberProfile'));
                   const canEditLikes = isViewerAdmin || Boolean(hasUserPermission(currentUser, 'canEditLikes'));
@@ -16928,7 +17220,7 @@ export default function App() {
                   const canMoveUsers = isViewerAdmin || Boolean(hasUserPermission(currentUser, 'canMoveUsers'));
                   const canAssignBanner = isViewerAdmin || Boolean(hasUserPermission(currentUser, 'canAssignBanner') || hasUserPermission(currentUser, 'canAssignBanners'));
 
-                  const hasAnyModPower = canKick || canMute || canBan || canWarn || canDeleteAvatar || canJail || canPullMic || canEditProfile || canEditLikes || canEditPoints || canChangeRoles || canChangePassword || canMoveUsers;
+                  const hasAnyModPower = canKick || canMute || canMuteVoice || canBan || canWarn || canDeleteAvatar || canJail || canPullMic || canEditProfile || canEditLikes || canEditPoints || canChangeRoles || canChangePassword || canMoveUsers;
 
                   return (
                     <div className="space-y-3">
@@ -17183,6 +17475,31 @@ export default function App() {
                               >
                                 <VolumeX className="w-3.5 h-3.5 shrink-0" />
                                 <span className="truncate">{profileTargetUser.isTextMuted ? 'إلغاء الإسكات' : '🚫 إسكات'}</span>
+                              </button>
+                            )}
+
+                            {/* Voice Mic Mute / Unmute */}
+                            {canMuteVoice && !isSelf && (
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  const isVoiceMuted = Boolean(profileTargetUser.isVoiceMutedByAdmin || profileTargetUser.isMuted);
+                                  handleAdminAction(isVoiceMuted ? 'unmuteVoice' : 'muteVoice', profileTargetUser.username);
+                                }}
+                                className={`p-2 rounded-lg border flex items-center justify-center gap-1 min-w-0 truncate ${
+                                  profileTargetUser.isVoiceMutedByAdmin || profileTargetUser.isMuted
+                                    ? 'bg-emerald-50 text-emerald-700 border-emerald-300'
+                                    : 'bg-slate-100 hover:bg-slate-200 text-rose-600'
+                                }`}
+                              >
+                                {profileTargetUser.isVoiceMutedByAdmin || profileTargetUser.isMuted ? (
+                                  <Mic className="w-3.5 h-3.5 shrink-0" />
+                                ) : (
+                                  <MicOff className="w-3.5 h-3.5 shrink-0" />
+                                )}
+                                <span className="truncate">
+                                  {profileTargetUser.isVoiceMutedByAdmin || profileTargetUser.isMuted ? 'فك كتم المايك' : '🔇 كتم المايك'}
+                                </span>
                               </button>
                             )}
 
@@ -17652,7 +17969,8 @@ export default function App() {
                   if (currentUser?.micSlot !== null) {
                     handleDropMic();
                   } else {
-                    handleTakeMic(1);
+                    const freeSlot = micSlots.find((s) => !s.user)?.slotNumber || 1;
+                    handleTakeMic(freeSlot);
                   }
                 }}
                 socket={socket}
@@ -17876,10 +18194,22 @@ export default function App() {
                   if (currentUser?.micSlot !== null) {
                     handleDropMic();
                   } else {
-                    handleTakeMic(1);
+                    const freeSlot = micSlots.find((s) => !s.user)?.slotNumber || 1;
+                    handleTakeMic(freeSlot);
                   }
                 }}
                 onShowToast={showToast}
+                onApplyAudioSettings={(settings) => {
+                  audioManagerRef.current?.applyStudioSettings({
+                    effect: settings.effect,
+                    micGain: settings.micGain,
+                    noiseSuppression: settings.noiseSuppression,
+                    echoCancellation: settings.echoCancellation
+                  });
+                }}
+                onSetMicMuted={(muted) => {
+                  audioManagerRef.current?.setMutedState(muted);
+                }}
               />
             </Suspense>
           </ModalErrorBoundary>
@@ -19749,6 +20079,30 @@ export default function App() {
               </div>
             </div>
           </div>
+        )}
+
+        {/* 🎵 HIDDEN DEVICE STORAGE PICKER & FLOATING SHARED MUSIC PLAYER FOR MIC HOLDERS */}
+        <input
+          ref={musicFileInputRef}
+          type="file"
+          accept="audio/*,video/*"
+          onChange={handleMusicFileSelected}
+          className="hidden"
+        />
+        {currentUser.micSlot !== null && sharedMusicState.isActive && (
+          <MusicShareMiniPlayer
+            musicState={sharedMusicState}
+            isMicMuted={Boolean(audioManager?.isMuted || currentUser.isMuted)}
+            onTogglePlayPause={() => audioManager?.toggleSharedMusicPause()}
+            onStop={() => {
+              audioManager?.stopSharedMusic();
+              showToast('تم إيقاف مشاركة الموسيقى وإغلاق المشغل 🎵', 'info');
+            }}
+            onSeek={(sec) => audioManager?.seekSharedMusic(sec)}
+            onVolumeChange={(vol) => audioManager?.setSharedMusicVolume(vol)}
+            onReplaceTrack={handleOpenMusicPicker}
+            onToggleMicMute={handleToggleMicMuteUnified}
+          />
         )}
 
         {/* 🎵 ULTRA-RESILIENT BACKGROUND AUDIO ENGINE (مشغل الصوت بالخلفية دائم التثبيت في الـ DOM ومربوط بـ MediaSessionManager) */}

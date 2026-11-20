@@ -31,6 +31,7 @@ export class LiveBroadcastAudioManager {
   private pcmBuffer: Float32Array[] = [];
   private pcmTotalSamples = 0;
   private isFallbackStreaming = false;
+  private pcmFallbackExpireTimer: ReturnType<typeof setTimeout> | null = null;
 
   // Viewer state
   private broadcasterId: string | null = null;
@@ -73,8 +74,18 @@ export class LiveBroadcastAudioManager {
     });
 
     this.on('enableLiveAudioFallback', () => {
-      if (this.role === 'broadcaster' && this.localStream && !this.isFallbackStreaming) {
-        this.startPcmFallbackStreaming();
+      if (this.role === 'broadcaster' && this.localStream) {
+        if (!this.isFallbackStreaming) {
+          this.startPcmFallbackStreaming();
+        }
+        this.touchPcmFallbackTimer();
+      }
+    });
+
+    this.on('liveBroadcasterReconnected', ({ broadcasterId }: { broadcasterId: string }) => {
+      if (this.role === 'viewer' && broadcasterId) {
+        this.broadcasterId = broadcasterId;
+        this.requestFallback();
       }
     });
 
@@ -210,6 +221,7 @@ export class LiveBroadcastAudioManager {
       try {
         pc.onicecandidate = null;
         pc.oniceconnectionstatechange = null;
+        pc.onconnectionstatechange = null;
         pc.close();
       } catch {}
       this.viewerPeers.delete(viewerId);
@@ -273,10 +285,25 @@ export class LiveBroadcastAudioManager {
       source.connect(processor);
       processor.connect(silentGain);
       silentGain.connect(ctx.destination);
+      this.touchPcmFallbackTimer();
     } catch {}
   }
 
+  private touchPcmFallbackTimer() {
+    if (this.pcmFallbackExpireTimer) {
+      clearTimeout(this.pcmFallbackExpireTimer);
+    }
+    this.pcmFallbackExpireTimer = setTimeout(() => {
+      this.pcmFallbackExpireTimer = null;
+      this.stopPcmFallback();
+    }, 12000);
+  }
+
   private stopPcmFallback() {
+    if (this.pcmFallbackExpireTimer) {
+      clearTimeout(this.pcmFallbackExpireTimer);
+      this.pcmFallbackExpireTimer = null;
+    }
     this.isFallbackStreaming = false;
     this.pcmBuffer = [];
     this.pcmTotalSamples = 0;

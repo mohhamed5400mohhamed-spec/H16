@@ -172,6 +172,7 @@ export const PrivateCallOverlay: React.FC<PrivateCallOverlayProps> = ({
         pcRef.current.ontrack = null;
         pcRef.current.onicecandidate = null;
         pcRef.current.oniceconnectionstatechange = null;
+        pcRef.current.onconnectionstatechange = null;
         pcRef.current.close();
       } catch {}
       pcRef.current = null;

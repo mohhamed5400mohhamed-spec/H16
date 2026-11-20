@@ -13,14 +13,17 @@ export interface VoiceNoteData {
 interface VoiceRecorderProps {
   onSendVoice: (voiceData: VoiceNoteData) => void;
   onCancel: () => void;
+  onError?: (errorMsg: string) => void;
 }
 
-export const VoiceRecorder: React.FC<VoiceRecorderProps> = ({ onSendVoice, onCancel }) => {
+export const VoiceRecorder: React.FC<VoiceRecorderProps> = ({ onSendVoice, onCancel, onError }) => {
   const [isRecording, setIsRecording] = useState(false);
   const [recordSeconds, setRecordSeconds] = useState(0);
   const [audioBlobUrl, setAudioBlobUrl] = useState<string | null>(null);
   const [recordedDuration, setRecordedDuration] = useState(0);
   const [isPlayingPreview, setIsPlayingPreview] = useState(false);
+  const [isUploading, setIsUploading] = useState(false);
+  const [micError, setMicError] = useState<string | null>(null);
 
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const audioChunksRef = useRef<Blob[]>([]);
@@ -53,53 +56,11 @@ export const VoiceRecorder: React.FC<VoiceRecorderProps> = ({ onSendVoice, onCan
     }
   };
 
-  // Helper to generate a realistic playable synthetic wav sound if mic permission is blocked in browser/iframe sandbox
-  const generateSyntheticAudioWav = (durationSecs: number): string => {
-    try {
-      const sampleRate = 8000;
-      const numSamples = Math.floor(sampleRate * Math.max(1, durationSecs));
-      const buffer = new ArrayBuffer(44 + numSamples * 2);
-      const view = new DataView(buffer);
-
-      const writeStr = (offset: number, str: string) => {
-        for (let i = 0; i < str.length; i++) view.setUint8(offset + i, str.charCodeAt(i));
-      };
-
-      writeStr(0, 'RIFF');
-      view.setUint32(4, 36 + numSamples * 2, true);
-      writeStr(8, 'WAVE');
-      writeStr(12, 'fmt ');
-      view.setUint32(16, 16, true);
-      view.setUint16(20, 1, true); // PCM
-      view.setUint16(22, 1, true); // Mono
-      view.setUint32(24, sampleRate, true);
-      view.setUint32(28, sampleRate * 2, true);
-      view.setUint16(32, 2, true);
-      view.setUint16(34, 16, true);
-      writeStr(36, 'data');
-      view.setUint32(40, numSamples * 2, true);
-
-      let offset = 44;
-      for (let i = 0; i < numSamples; i++) {
-        const t = i / sampleRate;
-        const sample =
-          Math.sin(2 * Math.PI * 440 * t) * 0.25 * Math.exp(-t * 0.4) +
-          Math.sin(2 * Math.PI * 330 * t) * 0.15;
-        const clamped = Math.max(-1, Math.min(1, sample));
-        view.setInt16(offset, clamped < 0 ? clamped * 0x8000 : clamped * 0x7fff, true);
-        offset += 2;
-      }
-
-      const bytes = new Uint8Array(buffer);
-      let binary = '';
-      const len = bytes.byteLength;
-      for (let i = 0; i < len; i++) {
-        binary += String.fromCharCode(bytes[i]);
-      }
-      return 'data:audio/wav;base64,' + btoa(binary);
-    } catch {
-      return 'data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQAAAAA=';
-    }
+  const reportMicError = (msg: string) => {
+    setIsRecording(false);
+    setIsUploading(false);
+    setMicError(msg);
+    onError?.(msg);
   };
 
   const startRecording = async () => {
@@ -107,11 +68,12 @@ export const VoiceRecorder: React.FC<VoiceRecorderProps> = ({ onSendVoice, onCan
     setRecordSeconds(0);
     setRecordedDuration(0);
     setAudioBlobUrl(null);
+    setMicError(null);
     audioBlobUrlRef.current = null;
     pendingSendRef.current = false;
 
-    if (!navigator?.mediaDevices?.getUserMedia) {
-      simulateVoiceRecord();
+    if (!navigator?.mediaDevices?.getUserMedia || typeof MediaRecorder === 'undefined') {
+      reportMicError('المتصفح الحالي لا يدعم تسجيل الصوت بالميكروفون.');
       return;
     }
 
@@ -144,10 +106,17 @@ export const VoiceRecorder: React.FC<VoiceRecorderProps> = ({ onSendVoice, onCan
         stream.getTracks().forEach((t) => t.stop());
         const finalSec = Math.max(1, Math.floor((Date.now() - startTimeRef.current) / 1000));
 
+        if (!audioBlob || audioBlob.size === 0) {
+          reportMicError('لم يتم التقاط أي صوت من الميكروفون.');
+          return;
+        }
+
+        setIsUploading(true);
         try {
           const ext = mimeType.includes('mp4') ? 'mp4' : 'webm';
           const audioFile = new File([audioBlob], `voice_${Date.now()}.${ext}`, { type: mimeType });
           const res = await uploadMediaWithProgress(audioFile);
+          setIsUploading(false);
           if (res?.url) {
             setAudioBlobUrl(res.url);
             audioBlobUrlRef.current = res.url;
@@ -158,9 +127,12 @@ export const VoiceRecorder: React.FC<VoiceRecorderProps> = ({ onSendVoice, onCan
                 duration: finalSec
               });
             }
+          } else {
+            reportMicError('تعذر رفع التسجيل الصوتي للسيرفر.');
           }
         } catch (err) {
           console.warn('Failed to upload audio binary:', err);
+          reportMicError('حدث خطأ أثناء رفع المقطع الصوتي.');
         }
       };
 
@@ -175,24 +147,12 @@ export const VoiceRecorder: React.FC<VoiceRecorderProps> = ({ onSendVoice, onCan
         }
       }, 250);
     } catch (err: any) {
-      // Permission not granted or device blocked in sandbox
-      console.warn('Microphone permission not granted, using simulated audio engine:', err?.message || err);
-      simulateVoiceRecord();
+      const msg =
+        err?.name === 'NotAllowedError'
+          ? 'تم رفض إذن الميكروفون. يرجى تفعيل المايك من إعدادات المتصفح.'
+          : 'تعذر تشغيل الميكروفون: ' + (err?.message || 'تأكد من توصيل المايك');
+      reportMicError(msg);
     }
-  };
-
-  const simulateVoiceRecord = () => {
-    setIsRecording(true);
-    startTimeRef.current = Date.now();
-    setRecordSeconds(0);
-
-    timerRef.current = setInterval(() => {
-      const elapsed = Math.max(0, Math.floor((Date.now() - startTimeRef.current) / 1000));
-      setRecordSeconds(elapsed);
-      if (elapsed >= 120) {
-        stopRecording();
-      }
-    }, 250);
   };
 
   const stopRecording = () => {
@@ -208,10 +168,6 @@ export const VoiceRecorder: React.FC<VoiceRecorderProps> = ({ onSendVoice, onCan
       } catch (e) {
         // ignore
       }
-    } else {
-      const syntheticUrl = generateSyntheticAudioWav(finalSec);
-      setAudioBlobUrl(syntheticUrl);
-      audioBlobUrlRef.current = syntheticUrl;
     }
   };
 
@@ -221,14 +177,6 @@ export const VoiceRecorder: React.FC<VoiceRecorderProps> = ({ onSendVoice, onCan
     if (isRecording) {
       pendingSendRef.current = true;
       stopRecording();
-      // If simulated fallback, send immediately
-      if (!mediaRecorderRef.current || mediaRecorderRef.current.state === 'inactive') {
-        const syntheticUrl = generateSyntheticAudioWav(finalDuration);
-        onSendVoice({
-          audioUrl: syntheticUrl,
-          duration: finalDuration
-        });
-      }
       return;
     }
 
@@ -237,12 +185,10 @@ export const VoiceRecorder: React.FC<VoiceRecorderProps> = ({ onSendVoice, onCan
         audioUrl: audioBlobUrl || audioBlobUrlRef.current!,
         duration: finalDuration
       });
+    } else if (isUploading) {
+      pendingSendRef.current = true;
     } else {
-      const syntheticUrl = generateSyntheticAudioWav(finalDuration);
-      onSendVoice({
-        audioUrl: syntheticUrl,
-        duration: finalDuration
-      });
+      reportMicError('لم يجهز الملف الصوتي للإرسال بعد.');
     }
   };
 
@@ -251,6 +197,24 @@ export const VoiceRecorder: React.FC<VoiceRecorderProps> = ({ onSendVoice, onCan
     const s = secs % 60;
     return `${m < 10 ? '0' : ''}${m}:${s < 10 ? '0' : ''}${s}`;
   };
+
+  if (micError) {
+    return (
+      <div className="flex items-center justify-between gap-2 px-3 py-1.5 bg-rose-50 border border-rose-300 rounded-2xl w-full max-w-md shadow-xs text-xs text-rose-700 font-bold">
+        <span className="truncate">{micError}</span>
+        <button
+          type="button"
+          onClick={() => {
+            cleanup();
+            onCancel();
+          }}
+          className="px-2.5 py-1 bg-rose-600 hover:bg-rose-700 text-white rounded-xl text-[11px] shrink-0 cursor-pointer"
+        >
+          إغلاق
+        </button>
+      </div>
+    );
+  }
 
   return (
     <div className="flex items-center gap-2 px-3 py-1.5 bg-rose-50 border border-rose-300 rounded-2xl animate-in fade-in duration-150 w-full max-w-md shadow-xs select-none">

@@ -86,6 +86,15 @@ export function optimizeSdpForWeakNetworks(sdp: string): string {
     .replace(/a=fmtp:96 ((?:(?!usedtx=1).)*)\r\n/g, 'a=fmtp:96 $1;useinbandfec=1;usedtx=1;maxaveragebitrate=24000;stereo=0\r\n');
 }
 
+export interface SharedMusicState {
+  isActive: boolean;
+  isPlaying: boolean;
+  trackName: string;
+  currentTime: number;
+  duration: number;
+  volume: number;
+}
+
 export interface RemoteVoicePeer {
   id: string;
   username: string;
@@ -97,6 +106,7 @@ export interface RemoteVoicePeer {
   isRemoteSpeaker?: boolean;
   isInitiator?: boolean;
   iceRestartAttempts?: number;
+  wasSpeakerLeft?: boolean;
 }
 
 // Encode Float32 PCM samples (at sourceSampleRate) downsampled to 16kHz Int16 mono WAV base64
@@ -155,6 +165,7 @@ export class AudioMeshManager {
   private voiceWatchdogTimer: ReturnType<typeof setInterval> | null = null;
 
   public isMuted = false;
+  public isAdminMuted = false;
   public isDeafened = false;
   public isInVoice = false; // True when user is holding a mic
   public isListening = true; // True whenever user is inside a chat room
@@ -166,6 +177,28 @@ export class AudioMeshManager {
   private animFrameId: number | null = null;
   private lastSpeakingState = false;
 
+  // Web Audio Studio processing chain (Gain + Voice Modulator Effects)
+  private studioEffect: 'normal' | 'falcon' | 'robot' | 'helium' | 'studio' | 'radio' | 'echo' = 'normal';
+  private studioGainPercent = 100;
+  private studioSource: MediaStreamAudioSourceNode | null = null;
+  private studioDest: MediaStreamAudioDestinationNode | null = null;
+  private studioCleanupFns: Array<() => void> = [];
+
+  // Shared Room Music Mixer (streams audio from user-selected audio/video file alongside mic voice)
+  private musicEl: HTMLVideoElement | null = null;
+  private musicMediaSource: MediaElementAudioSourceNode | null = null;
+  private musicBroadcastGain: GainNode | null = null;
+  private musicMonitorGain: GainNode | null = null;
+  private musicObjectUrl: string | null = null;
+  private musicState: SharedMusicState = {
+    isActive: false,
+    isPlaying: false,
+    trackName: '',
+    currentTime: 0,
+    duration: 0,
+    volume: 75
+  };
+
   // On-demand PCM-WAV fallback streaming (only active if a listener requests fallback due to firewall/NAT block)
   private pcmProcessor: ScriptProcessorNode | null = null;
   private pcmSource: MediaStreamAudioSourceNode | null = null;
@@ -173,16 +206,19 @@ export class AudioMeshManager {
   private pcmBuffer: Float32Array[] = [];
   private pcmTotalSamples = 0;
   private isFallbackStreaming = false;
+  private pcmFallbackExpireTimer: ReturnType<typeof setTimeout> | null = null;
   private nextFallbackPlayTime: Map<string, number> = new Map();
 
   private audioContainerEl: HTMLElement | null = null;
   private gestureUnlockAttached = false;
+  private unlockHandler: (() => void) | null = null;
 
   // Callbacks
   public onVolumeChange?: (volume: number) => void;
   public onPeersUpdated?: (peers: RemoteVoicePeer[]) => void;
   public onError?: (errorMsg: string) => void;
   public onAutoplayBlocked?: (blocked: boolean) => void;
+  public onSharedMusicChange?: (state: SharedMusicState) => void;
 
   private socketListeners: Array<{ event: string; fn: (...args: any[]) => void }> = [];
 
@@ -246,6 +282,7 @@ export class AudioMeshManager {
         this.unlockAudioPlayback();
       }
     };
+    this.unlockHandler = unlock;
     window.addEventListener('pointerdown', unlock, { passive: true });
     window.addEventListener('touchstart', unlock, { passive: true });
     window.addEventListener('click', unlock, { passive: true });
@@ -332,8 +369,11 @@ export class AudioMeshManager {
 
     // Server instructs this speaker to stream PCM-WAV fallback chunks because a listener couldn't connect via WebRTC
     this.registerSocketListener('enableVoiceFallback', () => {
-      if (this.isInVoice && this.localStream && !this.isFallbackStreaming) {
-        this.startPcmFallbackStreaming();
+      if (this.isInVoice && this.localStream) {
+        if (!this.isFallbackStreaming) {
+          this.startPcmFallbackStreaming();
+        }
+        this.touchPcmFallbackTimer();
       }
     });
 
@@ -379,6 +419,8 @@ export class AudioMeshManager {
         const peer = this.peers.get(userId);
         if (peer) {
           peer.isRemoteSpeaker = false;
+          peer.wasSpeakerLeft = true;
+          peer.isSpeaking = false;
           if (peer.audioElement) {
             peer.audioElement.pause();
             peer.audioElement.srcObject = null;
@@ -414,6 +456,10 @@ export class AudioMeshManager {
     this.fallbackTimers.clear();
     for (const t of this.disconnectRecoveryTimers.values()) clearTimeout(t);
     this.disconnectRecoveryTimers.clear();
+    if (this.pcmFallbackExpireTimer) {
+      clearTimeout(this.pcmFallbackExpireTimer);
+      this.pcmFallbackExpireTimer = null;
+    }
 
     if (this.isInVoice) {
       this.leaveVoice();
@@ -424,7 +470,13 @@ export class AudioMeshManager {
           peer.audioElement.srcObject = null;
           peer.audioElement.remove();
         }
-        peer.pc.close();
+        try {
+          peer.pc.ontrack = null;
+          peer.pc.onicecandidate = null;
+          peer.pc.oniceconnectionstatechange = null;
+          peer.pc.onconnectionstatechange = null;
+          peer.pc.close();
+        } catch {}
       });
       this.peers.clear();
       this.notifyPeers();
@@ -449,10 +501,20 @@ export class AudioMeshManager {
       this.localStream = stream;
       this.isInVoice = true;
       this.isListening = true;
-      this.isMuted = false;
+      this.isMuted = this.isAdminMuted;
+      if (this.isMuted) {
+        stream.getAudioTracks().forEach((t) => {
+          t.enabled = false;
+        });
+      }
 
       // Setup Audio Visualizer and Speech Detection
       this.setupAudioAnalysis(stream);
+
+      // Re-apply studio equalizer settings if configured before climbing mic
+      if (this.studioEffect !== 'normal' || this.studioGainPercent !== 100) {
+        this.rebuildStudioChain();
+      }
 
       // Unlock playback context simultaneously inside user gesture
       this.unlockAudioPlayback().catch(() => {});
@@ -469,14 +531,34 @@ export class AudioMeshManager {
     }
   }
 
-  // Take one of the 5 Mic Slots
-  public async takeMicSlot(slotNumber: number): Promise<boolean> {
+  // Take one of the 5 Mic Slots (waits for server acknowledgment and rolls back mic stream if rejected)
+  public async takeMicSlot(slotNumber: number): Promise<{ ok: boolean; error?: string }> {
     const success = await this.joinVoice();
-    if (success) {
-      this.socket.emit('takeMic', { slotNumber });
-      return true;
+    if (!success) {
+      return { ok: false, error: 'تعذر الوصول إلى الميكروفون' };
     }
-    return false;
+
+    return new Promise((resolve) => {
+      let settled = false;
+      const timer = setTimeout(() => {
+        if (!settled) {
+          settled = true;
+          resolve({ ok: true });
+        }
+      }, 6000);
+
+      this.socket.emit('takeMic', { slotNumber }, (res?: { ok?: boolean; error?: string }) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        if (res && res.ok === false) {
+          this.leaveVoice();
+          resolve({ ok: false, error: res.error || 'تعذر الصعود إلى المايك' });
+          return;
+        }
+        resolve({ ok: true });
+      });
+    });
   }
 
   // Drop Mic Slot
@@ -492,6 +574,7 @@ export class AudioMeshManager {
         existing.pc.ontrack = null;
         existing.pc.onicecandidate = null;
         existing.pc.oniceconnectionstatechange = null;
+        existing.pc.onconnectionstatechange = null;
         existing.pc.close();
       } catch {}
       if (existing.audioElement) {
@@ -611,6 +694,8 @@ export class AudioMeshManager {
   // Initiate call to an existing peer (or cleanly upgrade existing recvonly connection on mic re-climb)
   private async initiateCallTo(targetId: string, username: string, isRemoteSpeaker = false) {
     if (!this.localStream) return;
+    const outgoingTrack = this.getOutgoingAudioTrack();
+    const outgoingStream = this.studioDest?.stream || this.localStream;
 
     const existing = this.peers.get(targetId);
     if (existing && existing.pc && existing.pc.signalingState === 'stable') {
@@ -621,16 +706,15 @@ export class AudioMeshManager {
       try {
         existing.isInitiator = true;
         if (isRemoteSpeaker) existing.isRemoteSpeaker = true;
-        const audioTrack = this.localStream.getAudioTracks()[0];
-        if (audioTrack) {
+        if (outgoingTrack) {
           const audioTransceiver = existing.pc.getTransceivers().find(
             (tr) => tr.receiver?.track?.kind === 'audio' || tr.sender?.track?.kind === 'audio' || tr.sender
           );
           if (audioTransceiver) {
             audioTransceiver.direction = 'sendrecv';
-            await audioTransceiver.sender.replaceTrack(audioTrack);
+            await audioTransceiver.sender.replaceTrack(outgoingTrack);
           } else {
-            existing.pc.addTrack(audioTrack, this.localStream);
+            existing.pc.addTrack(outgoingTrack, outgoingStream);
           }
         }
         let offer = await existing.pc.createOffer();
@@ -650,9 +734,13 @@ export class AudioMeshManager {
     const pc = peer.pc;
 
     // Add local tracks
-    this.localStream.getTracks().forEach((track) => {
-      pc.addTrack(track, this.localStream!);
-    });
+    if (outgoingTrack) {
+      pc.addTrack(outgoingTrack, outgoingStream);
+    } else {
+      this.localStream.getTracks().forEach((track) => {
+        pc.addTrack(track, this.localStream!);
+      });
+    }
 
     // Create & send offer optimized for weak mobile networks
     try {
@@ -676,19 +764,39 @@ export class AudioMeshManager {
   private async handleReceiveOffer(senderId: string, senderUsername: string, offer: RTCSessionDescriptionInit) {
     let peer = this.peers.get(senderId);
 
-    // If there is a glare (both created offers) or unstable state, recreate cleanly when receiving an authoritative speaker offer
-    if (!peer || peer.pc.signalingState === 'have-local-offer') {
-      peer = this.createPeerConnection(senderId, senderUsername, true, false);
-      if (this.isInVoice && this.localStream) {
-        this.localStream.getTracks().forEach((track) => {
-          peer!.pc.addTrack(track, this.localStream!);
-        });
-      }
-    } else {
-      peer.isRemoteSpeaker = true;
+    // Deterministic polite/impolite glare resolution when both peers climb mic at the exact same moment
+    if (peer && peer.pc.signalingState === 'have-local-offer' && this.isInVoice && this.socket.id && this.socket.id > senderId) {
+      return;
     }
 
-    const pc = peer.pc;
+    const needsFreshPc =
+      !peer ||
+      peer.wasSpeakerLeft ||
+      peer.pc.signalingState === 'have-local-offer' ||
+      peer.pc.iceConnectionState === 'failed' ||
+      peer.pc.iceConnectionState === 'closed' ||
+      peer.pc.connectionState === 'failed' ||
+      peer.pc.connectionState === 'closed';
+
+    if (needsFreshPc) {
+      peer = this.createPeerConnection(senderId, senderUsername, true, false);
+      if (this.isInVoice && this.localStream) {
+        const outgoingTrack = this.getOutgoingAudioTrack();
+        const outgoingStream = this.studioDest?.stream || this.localStream;
+        if (outgoingTrack) {
+          peer.pc.addTrack(outgoingTrack, outgoingStream);
+        } else {
+          this.localStream.getTracks().forEach((track) => {
+            peer!.pc.addTrack(track, this.localStream!);
+          });
+        }
+      }
+    } else if (peer) {
+      peer.isRemoteSpeaker = true;
+      peer.wasSpeakerLeft = false;
+    }
+
+    const pc = peer!.pc;
     await pc.setRemoteDescription(new RTCSessionDescription(offer));
 
     // Flush any queued ICE candidates that arrived before remote description
@@ -792,7 +900,8 @@ export class AudioMeshManager {
         ctx.resume().catch(() => {});
       }
 
-      const source = ctx.createMediaStreamSource(this.localStream);
+      const sourceStream = this.studioDest?.stream || this.localStream;
+      const source = ctx.createMediaStreamSource(sourceStream);
       const processor = ctx.createScriptProcessor(4096, 1, 1);
       const silentGain = ctx.createGain();
       silentGain.gain.value = 0;
@@ -807,7 +916,8 @@ export class AudioMeshManager {
       const targetChunkSamples = Math.round(ctx.sampleRate * 0.36); // ~360ms standalone WAV chunk
 
       processor.onaudioprocess = (e) => {
-        if (!this.isInVoice || this.isMuted || !this.isFallbackStreaming) return;
+        const allowOutgoing = !this.isAdminMuted && (!this.isMuted || this.musicState.isPlaying);
+        if (!this.isInVoice || !allowOutgoing || !this.isFallbackStreaming) return;
         const input = e.inputBuffer.getChannelData(0);
         const copy = new Float32Array(input.length);
         copy.set(input);
@@ -840,12 +950,27 @@ export class AudioMeshManager {
       source.connect(processor);
       processor.connect(silentGain);
       silentGain.connect(ctx.destination);
+      this.touchPcmFallbackTimer();
     } catch (err) {
       console.warn('PCM fallback stream setup notice:', err);
     }
   }
 
+  private touchPcmFallbackTimer() {
+    if (this.pcmFallbackExpireTimer) {
+      clearTimeout(this.pcmFallbackExpireTimer);
+    }
+    this.pcmFallbackExpireTimer = setTimeout(() => {
+      this.pcmFallbackExpireTimer = null;
+      this.stopPcmFallbackStreaming();
+    }, 12000);
+  }
+
   private stopPcmFallbackStreaming() {
+    if (this.pcmFallbackExpireTimer) {
+      clearTimeout(this.pcmFallbackExpireTimer);
+      this.pcmFallbackExpireTimer = null;
+    }
     this.isFallbackStreaming = false;
     this.pcmBuffer = [];
     this.pcmTotalSamples = 0;
@@ -923,13 +1048,25 @@ export class AudioMeshManager {
       const checkVolume = () => {
         if (!this.analyser || !this.isInVoice) return;
 
-        if (this.isMuted) {
+        if (this.isAdminMuted || (this.isMuted && !this.musicState.isPlaying)) {
           if (this.lastSpeakingState) {
             this.lastSpeakingState = false;
             this.socket.emit('voiceStateUpdate', { isSpeaking: false });
           }
           if (this.onVolumeChange) {
             this.onVolumeChange(0);
+          }
+          this.animFrameId = requestAnimationFrame(checkVolume);
+          return;
+        }
+
+        if (this.isMuted && this.musicState.isPlaying) {
+          if (!this.lastSpeakingState) {
+            this.lastSpeakingState = true;
+            this.socket.emit('voiceStateUpdate', { isSpeaking: true });
+          }
+          if (this.onVolumeChange) {
+            this.onVolumeChange(Math.max(15, Math.min(85, Math.round(this.musicState.volume * 0.65))));
           }
           this.animFrameId = requestAnimationFrame(checkVolume);
           return;
@@ -948,7 +1085,7 @@ export class AudioMeshManager {
           this.onVolumeChange(volumePercent);
         }
 
-        const isSpeakingNow = volumePercent > 12;
+        const isSpeakingNow = volumePercent > 12 || this.musicState.isPlaying;
         if (isSpeakingNow !== this.lastSpeakingState) {
           this.lastSpeakingState = isSpeakingNow;
           this.socket.emit('voiceStateUpdate', { isSpeaking: isSpeakingNow });
@@ -963,24 +1100,506 @@ export class AudioMeshManager {
     }
   }
 
+  private getOutgoingAudioTrack(): MediaStreamTrack | null {
+    return this.studioDest?.stream.getAudioTracks()[0] || this.localStream?.getAudioTracks()[0] || null;
+  }
+
+  private cleanupStudioChain() {
+    for (const fn of this.studioCleanupFns) {
+      try { fn(); } catch {}
+    }
+    this.studioCleanupFns = [];
+    try { this.studioSource?.disconnect(); } catch {}
+    try { this.studioDest?.disconnect(); } catch {}
+    this.studioSource = null;
+    this.studioDest = null;
+  }
+
+  private notifySharedMusic() {
+    this.onSharedMusicChange?.({ ...this.musicState });
+  }
+
+  public getSharedMusicState(): SharedMusicState {
+    return { ...this.musicState };
+  }
+
+  private ensureAudioContext(): AudioContext | null {
+    if (typeof window === 'undefined') return null;
+    const AudioCtx = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+    if (!this.audioCtx || this.audioCtx.state === 'closed') {
+      this.audioCtx = new AudioCtx();
+    }
+    if (this.audioCtx.state === 'suspended') {
+      this.audioCtx.resume().catch(() => {});
+    }
+    return this.audioCtx;
+  }
+
+  private ensureMusicAudioGraph(ctx: AudioContext) {
+    this.ensureAudioContainer();
+    if (!this.musicEl) {
+      const el = document.createElement('video');
+      el.playsInline = true;
+      el.setAttribute('playsinline', 'true');
+      el.setAttribute('webkit-playsinline', 'true');
+      el.preload = 'auto';
+      el.muted = false;
+      el.volume = 1;
+      el.style.position = 'fixed';
+      el.style.width = '1px';
+      el.style.height = '1px';
+      el.style.opacity = '0.001';
+      el.style.pointerEvents = 'none';
+      if (this.audioContainerEl) {
+        this.audioContainerEl.appendChild(el);
+      } else if (typeof document !== 'undefined') {
+        document.body.appendChild(el);
+      }
+
+      el.addEventListener('loadedmetadata', () => {
+        this.musicState.duration = Number.isFinite(el.duration) ? el.duration : 0;
+        this.notifySharedMusic();
+      });
+      el.addEventListener('durationchange', () => {
+        this.musicState.duration = Number.isFinite(el.duration) ? el.duration : 0;
+        this.notifySharedMusic();
+      });
+      el.addEventListener('timeupdate', () => {
+        this.musicState.currentTime = el.currentTime || 0;
+        if (Number.isFinite(el.duration) && el.duration > 0) {
+          this.musicState.duration = el.duration;
+        }
+        this.notifySharedMusic();
+      });
+      el.addEventListener('play', () => {
+        this.musicState.isPlaying = true;
+        this.syncOutgoingTrackEnabledState();
+        this.notifySharedMusic();
+      });
+      el.addEventListener('pause', () => {
+        this.musicState.isPlaying = false;
+        this.syncOutgoingTrackEnabledState();
+        this.notifySharedMusic();
+      });
+      el.addEventListener('ended', () => {
+        this.musicState.isPlaying = false;
+        this.musicState.currentTime = 0;
+        try { el.currentTime = 0; } catch {}
+        this.syncOutgoingTrackEnabledState();
+        this.notifySharedMusic();
+      });
+      el.addEventListener('error', () => {
+        if (this.musicState.isActive && el.getAttribute('src')) {
+          this.musicState.isPlaying = false;
+          this.notifySharedMusic();
+          this.onError?.('تعذر تشغيل هذا الملف الصوتي أو المرئي. يرجى اختيار ملف آخر مدعوم.');
+        }
+      });
+
+      this.musicEl = el;
+    }
+
+    if (!this.musicMediaSource) {
+      this.musicMediaSource = ctx.createMediaElementSource(this.musicEl);
+    }
+    const volRatio = Math.max(0, Math.min(1, this.musicState.volume / 100));
+    if (!this.musicBroadcastGain) {
+      this.musicBroadcastGain = ctx.createGain();
+      this.musicBroadcastGain.gain.value = volRatio;
+      this.musicMediaSource.connect(this.musicBroadcastGain);
+    }
+    if (!this.musicMonitorGain) {
+      this.musicMonitorGain = ctx.createGain();
+      this.musicMonitorGain.gain.value = volRatio;
+      this.musicMediaSource.connect(this.musicMonitorGain);
+      this.musicMonitorGain.connect(ctx.destination);
+    }
+  }
+
+  private syncOutgoingTrackEnabledState() {
+    if (this.localStream) {
+      this.localStream.getAudioTracks().forEach((track) => {
+        track.enabled = !this.isMuted && !this.isAdminMuted;
+      });
+    }
+    if (this.studioDest) {
+      const allowMixedOutgoing = !this.isAdminMuted && (!this.isMuted || this.musicState.isActive);
+      this.studioDest.stream.getAudioTracks().forEach((track) => {
+        track.enabled = allowMixedOutgoing;
+      });
+    }
+  }
+
+  public async startSharedMusic(file: File): Promise<boolean> {
+    if (!this.isInVoice || !this.localStream) {
+      this.onError?.('يجب أن تكون صاعداً على المايك أولاً لمشاركة صوت الموسيقى في الغرفة 🎙️');
+      return false;
+    }
+    if (this.isAdminMuted) {
+      this.onError?.('🔇 المايك مكتوم عنك من قبل الإدارة ولا يمكنك بث الموسيقى حالياً.');
+      return false;
+    }
+
+    const ctx = this.ensureAudioContext();
+    if (!ctx) return false;
+
+    try {
+      if (ctx.state === 'suspended') {
+        await ctx.resume().catch(() => {});
+      }
+      this.ensureMusicAudioGraph(ctx);
+      if (!this.musicEl) return false;
+
+      if (!this.musicEl.paused) {
+        this.musicEl.pause();
+      }
+      if (this.musicObjectUrl) {
+        URL.revokeObjectURL(this.musicObjectUrl);
+        this.musicObjectUrl = null;
+      }
+
+      const nextUrl = URL.createObjectURL(file);
+      this.musicObjectUrl = nextUrl;
+
+      const cleanTitle = (file.name || 'مقطع موسيقي').replace(/\.[^/.]+$/, '').trim() || 'مقطع موسيقي';
+      this.musicState = {
+        ...this.musicState,
+        isActive: true,
+        isPlaying: false,
+        trackName: cleanTitle,
+        currentTime: 0,
+        duration: 0
+      };
+
+      this.musicEl.src = nextUrl;
+      this.musicEl.load();
+
+      // Ensure WebRTC outgoing stream includes the mixed destination
+      this.rebuildStudioChain();
+      this.syncOutgoingTrackEnabledState();
+      this.notifySharedMusic();
+
+      try {
+        await this.musicEl.play();
+        this.musicState.isPlaying = true;
+        this.notifySharedMusic();
+      } catch {
+        this.musicState.isPlaying = false;
+        this.notifySharedMusic();
+      }
+      return true;
+    } catch (err) {
+      console.error('Failed to start shared music:', err);
+      this.onError?.('تعذر تحميل ملف الموسيقى المختار.');
+      return false;
+    }
+  }
+
+  public toggleSharedMusicPause(): boolean {
+    if (!this.musicEl || !this.musicState.isActive) return false;
+    if (this.isAdminMuted) {
+      this.onError?.('🔇 المايك مكتوم عنك من قبل الإدارة حالياً.');
+      return false;
+    }
+    const ctx = this.ensureAudioContext();
+    if (ctx && ctx.state === 'suspended') {
+      ctx.resume().catch(() => {});
+    }
+    if (this.musicEl.paused) {
+      this.musicEl.play().then(() => {
+        this.musicState.isPlaying = true;
+        this.notifySharedMusic();
+      }).catch(() => {});
+      return true;
+    } else {
+      this.musicEl.pause();
+      this.musicState.isPlaying = false;
+      this.notifySharedMusic();
+      return false;
+    }
+  }
+
+  public seekSharedMusic(seconds: number): void {
+    if (!this.musicEl || !this.musicState.isActive) return;
+    const maxDur = Number.isFinite(this.musicEl.duration) && this.musicEl.duration > 0
+      ? this.musicEl.duration
+      : this.musicState.duration;
+    const target = Math.max(0, maxDur > 0 ? Math.min(maxDur, seconds) : seconds);
+    try {
+      this.musicEl.currentTime = target;
+      this.musicState.currentTime = target;
+      this.notifySharedMusic();
+    } catch {}
+  }
+
+  public setSharedMusicVolume(percent: number): void {
+    const clamped = Math.max(0, Math.min(100, Math.round(percent)));
+    this.musicState.volume = clamped;
+    const ratio = clamped / 100;
+    const now = this.audioCtx?.currentTime || 0;
+    if (this.musicBroadcastGain) {
+      try {
+        this.musicBroadcastGain.gain.setValueAtTime(ratio, now);
+      } catch {
+        this.musicBroadcastGain.gain.value = ratio;
+      }
+    }
+    if (this.musicMonitorGain) {
+      try {
+        this.musicMonitorGain.gain.setValueAtTime(ratio, now);
+      } catch {
+        this.musicMonitorGain.gain.value = ratio;
+      }
+    }
+    this.notifySharedMusic();
+  }
+
+  public stopSharedMusic(opts?: { destroyElement?: boolean }): void {
+    const wasActive = this.musicState.isActive;
+    if (this.musicEl) {
+      try { this.musicEl.pause(); } catch {}
+      try {
+        this.musicEl.removeAttribute('src');
+        this.musicEl.load();
+      } catch {}
+    }
+    if (this.musicObjectUrl) {
+      URL.revokeObjectURL(this.musicObjectUrl);
+      this.musicObjectUrl = null;
+    }
+    this.musicState = {
+      isActive: false,
+      isPlaying: false,
+      trackName: '',
+      currentTime: 0,
+      duration: 0,
+      volume: this.musicState.volume
+    };
+
+    if (opts?.destroyElement) {
+      try { this.musicBroadcastGain?.disconnect(); } catch {}
+      try { this.musicMonitorGain?.disconnect(); } catch {}
+      try { this.musicMediaSource?.disconnect(); } catch {}
+      if (this.musicEl) {
+        try { this.musicEl.remove(); } catch {}
+      }
+      this.musicBroadcastGain = null;
+      this.musicMonitorGain = null;
+      this.musicMediaSource = null;
+      this.musicEl = null;
+    }
+
+    if (this.isInVoice && this.localStream && !opts?.destroyElement) {
+      this.rebuildStudioChain();
+      this.syncOutgoingTrackEnabledState();
+    }
+
+    if (wasActive || opts?.destroyElement) {
+      this.notifySharedMusic();
+    }
+  }
+
+  private rebuildStudioChain() {
+    this.cleanupStudioChain();
+    if (!this.localStream || !this.isInVoice) return;
+
+    const rawTrack = this.localStream.getAudioTracks()[0] || null;
+    const needsMixedChain = this.studioEffect !== 'normal' || this.studioGainPercent !== 100 || this.musicState.isActive;
+
+    if (!needsMixedChain) {
+      if (rawTrack) {
+        rawTrack.enabled = !this.isMuted && !this.isAdminMuted;
+        this.peers.forEach((peer) => {
+          peer.pc.getSenders().forEach((sender) => {
+            if (sender.track && sender.track.kind === 'audio') {
+              sender.replaceTrack(rawTrack).catch(() => {});
+            }
+          });
+        });
+      }
+      if (this.isFallbackStreaming) {
+        this.stopPcmFallbackStreaming();
+        this.startPcmFallbackStreaming();
+      }
+      return;
+    }
+
+    try {
+      const ctx = this.ensureAudioContext();
+      if (!ctx) return;
+
+      const source = ctx.createMediaStreamSource(this.localStream);
+      const dest = ctx.createMediaStreamDestination();
+      const masterGain = ctx.createGain();
+      masterGain.gain.value = Math.max(0.1, Math.min(2.0, this.studioGainPercent / 100));
+
+      this.studioSource = source;
+      this.studioDest = dest;
+      const nodes: AudioNode[] = [masterGain];
+
+      if (this.studioEffect === 'falcon') {
+        const bassBoost = ctx.createBiquadFilter();
+        bassBoost.type = 'lowshelf';
+        bassBoost.frequency.value = 220;
+        bassBoost.gain.value = 9;
+        source.connect(bassBoost);
+        bassBoost.connect(masterGain);
+        nodes.push(bassBoost);
+      } else if (this.studioEffect === 'helium') {
+        const trebleBoost = ctx.createBiquadFilter();
+        trebleBoost.type = 'highpass';
+        trebleBoost.frequency.value = 340;
+        const presence = ctx.createBiquadFilter();
+        presence.type = 'peaking';
+        presence.frequency.value = 2200;
+        presence.gain.value = 8;
+        source.connect(trebleBoost);
+        trebleBoost.connect(presence);
+        presence.connect(masterGain);
+        nodes.push(trebleBoost, presence);
+      } else if (this.studioEffect === 'radio') {
+        const bp = ctx.createBiquadFilter();
+        bp.type = 'bandpass';
+        bp.frequency.value = 1400;
+        bp.Q.value = 1.6;
+        source.connect(bp);
+        bp.connect(masterGain);
+        nodes.push(bp);
+      } else if (this.studioEffect === 'robot') {
+        const osc = ctx.createOscillator();
+        const oscGain = ctx.createGain();
+        const modGain = ctx.createGain();
+        osc.type = 'sawtooth';
+        osc.frequency.value = 55;
+        oscGain.gain.value = 0.5;
+        modGain.gain.value = 1.0;
+        osc.connect(oscGain);
+        oscGain.connect(modGain.gain);
+        source.connect(modGain);
+        modGain.connect(masterGain);
+        osc.start();
+        nodes.push(oscGain, modGain);
+        this.studioCleanupFns.push(() => {
+          try { osc.stop(); osc.disconnect(); } catch {}
+        });
+      } else if (this.studioEffect === 'studio' || this.studioEffect === 'echo') {
+        const dry = ctx.createGain();
+        const wet = ctx.createGain();
+        const delay = ctx.createDelay(1.0);
+        const feedback = ctx.createGain();
+        dry.gain.value = 0.9;
+        wet.gain.value = this.studioEffect === 'echo' ? 0.55 : 0.3;
+        delay.delayTime.value = this.studioEffect === 'echo' ? 0.28 : 0.11;
+        feedback.gain.value = this.studioEffect === 'echo' ? 0.42 : 0.2;
+        source.connect(dry);
+        dry.connect(masterGain);
+        source.connect(delay);
+        delay.connect(feedback);
+        feedback.connect(delay);
+        delay.connect(wet);
+        wet.connect(masterGain);
+        nodes.push(dry, wet, delay, feedback);
+      } else {
+        source.connect(masterGain);
+      }
+
+      masterGain.connect(dest);
+      if (this.musicState.isActive && this.musicBroadcastGain) {
+        this.musicBroadcastGain.connect(dest);
+        const bgGain = this.musicBroadcastGain;
+        this.studioCleanupFns.push(() => {
+          try { bgGain.disconnect(dest); } catch {}
+        });
+      }
+
+      this.studioCleanupFns.push(() => {
+        nodes.forEach((n) => {
+          try { n.disconnect(); } catch {}
+        });
+      });
+
+      const processedTrack = dest.stream.getAudioTracks()[0];
+      if (processedTrack) {
+        processedTrack.enabled = !this.isAdminMuted && (!this.isMuted || this.musicState.isActive);
+        this.peers.forEach((peer) => {
+          peer.pc.getSenders().forEach((sender) => {
+            if (sender.track && sender.track.kind === 'audio') {
+              sender.replaceTrack(processedTrack).catch(() => {});
+            }
+          });
+        });
+      }
+
+      if (this.isFallbackStreaming) {
+        this.stopPcmFallbackStreaming();
+        this.startPcmFallbackStreaming();
+      }
+    } catch (err) {
+      console.warn('Studio audio chain notice:', err);
+    }
+  }
+
+  public applyStudioSettings(opts: {
+    effect?: 'normal' | 'falcon' | 'robot' | 'helium' | 'studio' | 'radio' | 'echo';
+    micGain?: number;
+    noiseSuppression?: boolean;
+    echoCancellation?: boolean;
+  }) {
+    if (opts.effect) this.studioEffect = opts.effect;
+    if (typeof opts.micGain === 'number') this.studioGainPercent = opts.micGain;
+    if (this.localStream && (typeof opts.noiseSuppression === 'boolean' || typeof opts.echoCancellation === 'boolean')) {
+      this.localStream.getAudioTracks().forEach((track) => {
+        track
+          .applyConstraints({
+            noiseSuppression: opts.noiseSuppression ?? true,
+            echoCancellation: opts.echoCancellation ?? true,
+            autoGainControl: true
+          })
+          .catch(() => {});
+      });
+    }
+    if (this.isInVoice && this.localStream) {
+      this.rebuildStudioChain();
+    }
+  }
+
+  public setAdminMuted(muted: boolean) {
+    this.isAdminMuted = muted;
+    this.isMuted = muted;
+    if (muted && this.musicEl && !this.musicEl.paused) {
+      try { this.musicEl.pause(); } catch {}
+    }
+    this.syncOutgoingTrackEnabledState();
+    if (muted) {
+      this.lastSpeakingState = false;
+      this.onVolumeChange?.(0);
+    }
+  }
+
+  public setMutedState(muted: boolean): boolean {
+    if (!muted && this.isAdminMuted) {
+      this.isMuted = true;
+      this.onError?.('🔇 المايك مكتوم عنك من قبل الإدارة ولا يمكنك فتحه حالياً.');
+      return true;
+    }
+    if (!this.localStream) return this.isMuted;
+    this.isMuted = muted;
+    this.syncOutgoingTrackEnabledState();
+    if (muted && !this.musicState.isPlaying) {
+      this.lastSpeakingState = false;
+      this.onVolumeChange?.(0);
+    }
+    this.socket.emit('voiceStateUpdate', {
+      isMuted: this.isMuted,
+      isSpeaking: !muted ? this.lastSpeakingState : Boolean(this.musicState.isPlaying && !this.isAdminMuted)
+    });
+    return this.isMuted;
+  }
+
   // Toggle local mute
   public toggleMute(): boolean {
     if (!this.localStream) return false;
-    this.isMuted = !this.isMuted;
-    this.localStream.getAudioTracks().forEach((track) => {
-      track.enabled = !this.isMuted;
-    });
-
-    this.socket.emit('voiceStateUpdate', {
-      isMuted: this.isMuted,
-      isSpeaking: false
-    });
-
-    if (this.onVolumeChange && this.isMuted) {
-      this.onVolumeChange(0);
-    }
-
-    return this.isMuted;
+    return this.setMutedState(!this.isMuted);
   }
 
   // Toggle Deafen (mute all remote voices)
@@ -1003,6 +1622,11 @@ export class AudioMeshManager {
   // Close specific peer
   private closePeer(id: string) {
     this.pendingCandidates.delete(id);
+    const dt = this.disconnectRecoveryTimers.get(id);
+    if (dt) {
+      clearTimeout(dt);
+      this.disconnectRecoveryTimers.delete(id);
+    }
     const peer = this.peers.get(id);
     if (peer) {
       if (peer.audioElement) {
@@ -1011,6 +1635,10 @@ export class AudioMeshManager {
         peer.audioElement.remove();
       }
       try {
+        peer.pc.ontrack = null;
+        peer.pc.onicecandidate = null;
+        peer.pc.oniceconnectionstatechange = null;
+        peer.pc.onconnectionstatechange = null;
         peer.pc.close();
       } catch {}
       this.peers.delete(id);
@@ -1022,13 +1650,17 @@ export class AudioMeshManager {
   public leaveVoice() {
     if (!this.isInVoice) return;
     this.isInVoice = false;
+    this.isMuted = this.isAdminMuted;
+    this.lastSpeakingState = false;
 
     if (this.animFrameId) {
       cancelAnimationFrame(this.animFrameId);
       this.animFrameId = null;
     }
 
+    this.stopSharedMusic({ destroyElement: true });
     this.stopPcmFallbackStreaming();
+    this.cleanupStudioChain();
 
     if (this.localStream) {
       this.localStream.getTracks().forEach((t) => t.stop());
@@ -1072,6 +1704,13 @@ export class AudioMeshManager {
   // Complete cleanup and destroy manager instance
   public destroy() {
     this.isListening = false;
+    if (this.unlockHandler && typeof window !== 'undefined') {
+      window.removeEventListener('pointerdown', this.unlockHandler);
+      window.removeEventListener('touchstart', this.unlockHandler);
+      window.removeEventListener('click', this.unlockHandler);
+      this.unlockHandler = null;
+      this.gestureUnlockAttached = false;
+    }
     if (this.voiceWatchdogTimer) {
       clearInterval(this.voiceWatchdogTimer);
       this.voiceWatchdogTimer = null;
@@ -1084,6 +1723,10 @@ export class AudioMeshManager {
         peer.audioElement.remove();
       }
       try {
+        peer.pc.ontrack = null;
+        peer.pc.onicecandidate = null;
+        peer.pc.oniceconnectionstatechange = null;
+        peer.pc.onconnectionstatechange = null;
         peer.pc.close();
       } catch {}
     });
@@ -1106,6 +1749,7 @@ export class AudioMeshManager {
     this.onPeersUpdated = undefined;
     this.onError = undefined;
     this.onAutoplayBlocked = undefined;
+    this.onSharedMusicChange = undefined;
   }
 
   private notifyPeers() {
