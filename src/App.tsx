@@ -6271,14 +6271,7 @@ export default function App() {
     const currentSlot = micSlots.find((s) => s.slotNumber === slotNumber);
     if (currentSlot?.user) {
       if (currentSlot.user.id === currentUser.id || currentSlot.user.username === currentUser.username) {
-        if (currentUser.isVoiceMutedByAdmin || audioManager.isAdminMuted) {
-          sounds.playError();
-          showToast('🔇 المايك مكتوم عنك من قبل الإدارة ولا يمكنك فتحه حالياً.', 'error');
-          return;
-        }
-        const isMuted = audioManager.toggleMute();
-        sounds.playToggleMute(isMuted);
-        showToast(isMuted ? 'تم كتم المايك الخاص بك 🔇' : 'تم تفعيل المايك 🎙️', 'info');
+        handleToggleMicMuteUnified();
       } else {
         // If Admin/Super/Supreme/authorized moderator clicks occupied mic: offer option to Pull Mic!
         const canPull =
@@ -8114,11 +8107,7 @@ export default function App() {
               <span>مايك ({currentUser.micSlot})</span>
               <button
                 type="button"
-                onClick={() => {
-                  const muted = audioManager?.toggleMute() ?? false;
-                  sounds.playToggleMute(muted);
-                  showToast(muted ? 'تم كتم المايك 🔇' : 'تم تفعيل المايك 🎙️', 'info');
-                }}
+                onClick={handleToggleMicMuteUnified}
                 className="hover:text-amber-300 text-[9px] cursor-pointer"
               >
                 {currentUser.isMuted ? 'تفعيل' : 'كتم'}

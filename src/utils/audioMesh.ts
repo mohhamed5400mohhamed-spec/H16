@@ -182,6 +182,7 @@ export class AudioMeshManager {
   private studioGainPercent = 100;
   private studioSource: MediaStreamAudioSourceNode | null = null;
   private studioDest: MediaStreamAudioDestinationNode | null = null;
+  private studioMicMasterGain: GainNode | null = null;
   private studioCleanupFns: Array<() => void> = [];
 
   // Shared Room Music Mixer (streams audio from user-selected audio/video file alongside mic voice)
@@ -1113,6 +1114,7 @@ export class AudioMeshManager {
     try { this.studioDest?.disconnect(); } catch {}
     this.studioSource = null;
     this.studioDest = null;
+    this.studioMicMasterGain = null;
   }
 
   private notifySharedMusic() {
@@ -1221,6 +1223,18 @@ export class AudioMeshManager {
       this.localStream.getAudioTracks().forEach((track) => {
         track.enabled = !this.isMuted && !this.isAdminMuted;
       });
+    }
+    if (this.studioMicMasterGain) {
+      const targetMicGain =
+        this.isMuted || this.isAdminMuted
+          ? 0
+          : Math.max(0.1, Math.min(2.0, this.studioGainPercent / 100));
+      const now = this.audioCtx?.currentTime || 0;
+      try {
+        this.studioMicMasterGain.gain.setValueAtTime(targetMicGain, now);
+      } catch {
+        this.studioMicMasterGain.gain.value = targetMicGain;
+      }
     }
     if (this.studioDest) {
       const allowMixedOutgoing = !this.isAdminMuted && (!this.isMuted || this.musicState.isActive);
@@ -1435,10 +1449,14 @@ export class AudioMeshManager {
       const source = ctx.createMediaStreamSource(this.localStream);
       const dest = ctx.createMediaStreamDestination();
       const masterGain = ctx.createGain();
-      masterGain.gain.value = Math.max(0.1, Math.min(2.0, this.studioGainPercent / 100));
+      masterGain.gain.value =
+        this.isMuted || this.isAdminMuted
+          ? 0
+          : Math.max(0.1, Math.min(2.0, this.studioGainPercent / 100));
 
       this.studioSource = source;
       this.studioDest = dest;
+      this.studioMicMasterGain = masterGain;
       const nodes: AudioNode[] = [masterGain];
 
       if (this.studioEffect === 'falcon') {
